@@ -495,7 +495,7 @@ STYLE_CHOICES = [
 @client.tree.command(name="shop", description="戰績卡商店")
 @app_commands.guild_only()
 async def shop(interaction: discord.Interaction):
-    await interaction.response.defer()
+    await interaction.response.defer(ephemeral=True)  # only the person using it sees the shop
     credits, equipped, owned = get_wallet(interaction.guild_id, interaction.user.id)
     lines = []
     for key, (label, price, _) in STYLES.items():
@@ -515,7 +515,7 @@ async def shop(interaction: discord.Interaction):
     )
     embed.set_image(url="attachment://shop.png")
     png = await asyncio.to_thread(render_shop_preview)
-    await interaction.followup.send(embed=embed, file=discord.File(png, filename="shop.png"))
+    await interaction.followup.send(embed=embed, file=discord.File(png, filename="shop.png"), ephemeral=True)
 
 
 @client.tree.command(name="buy", description="購買戰績卡款式")
@@ -541,7 +541,8 @@ async def buy(interaction: discord.Interaction, style: app_commands.Choice[str])
     db.execute("INSERT INTO owned_styles (guild_id, user_id, style) VALUES (?, ?, ?)", (gid, uid, style.value))
     db.commit()
     await interaction.response.send_message(
-        f"🎉 {interaction.user.mention} 購買了「{label}」並已套用！剩餘金幣：{credits - price}"
+        f"🎉 你購買了「{label}」並已套用！剩餘金幣：{credits - price}",
+        ephemeral=True,
     )
 
 
@@ -623,10 +624,10 @@ async def spin(interaction: discord.Interaction):
                 db.execute(
                     "UPDATE players SET credits = credits + ? WHERE guild_id=? AND user_id=?", (STYLE_REFUND, gid, uid)
                 )
-                result = f"🌈 抽中「{style_label}」，但你已經擁有，換成 **{STYLE_REFUND} 金幣**！"
+                result = f"🌈 **超級 JACKPOT！** 抽中「{style_label}」，但你已經擁有，換成 **{STYLE_REFUND} 金幣**！"
             else:
                 db.execute("INSERT INTO owned_styles (guild_id, user_id, style) VALUES (?, ?, ?)", (gid, uid, value))
-                result = f"🌈 抽中限定卡面「**{style_label}**」！用 /style 套用"
+                result = f"🌈 **超級 JACKPOT！！** 抽中限定卡面「**{style_label}**」！用 /style 套用"
         db.commit()
         balance = get_wallet(gid, uid)[0]
 
