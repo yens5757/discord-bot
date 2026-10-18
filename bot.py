@@ -1,8 +1,10 @@
 import asyncio
+import hashlib
 import io
 import itertools
 import os
 import random
+import shutil
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -195,7 +197,7 @@ class Bot(discord.Client):
         self.owner_id = info.owner.id
         synced = await self.tree.sync()
         print(f"Synced {len(synced)} slash commands")
-        run_in_background(prepare_spin_gifs())
+        run_in_background(fill_spin_library())
 
 
 client = Bot()
@@ -594,35 +596,57 @@ async def shop(interaction: discord.Interaction):
 
 spin_lock = asyncio.Lock()
 
-# One ready-made GIF per prize, so /spin can reply straight away.
-# When one is used, a fresh one (new landing spot) is drawn in the background.
-spin_gifs = {}                     # prize index -> GIF bytes
-spin_refilling = set()             # prize indexes being drawn right now
+# Library of ready-made spin GIFs on disk: spin_gifs/<version>/<prize>/<n>.gif
+# /spin sends a random one for the rolled prize, then redraws one in the background
+# so the library slowly changes. The version is a fingerprint of wheel.py: edit the
+# wheel or its prizes and the old GIFs are thrown away and redrawn automatically.
+SPIN_VARIANTS = 10                 # GIFs kept per prize
+SPIN_DIR = Path(__file__).with_name("spin_gifs")
+SPIN_VERSION = hashlib.sha1(Path(__file__).with_name("wheel.py").read_bytes()).hexdigest()[:12]
+PRIZE_INDEX = {p[0]: i for i, p in enumerate(PRIZES)}
 spin_render_lock = asyncio.Lock()  # draw one GIF at a time: the server's CPU is small
 background_tasks = set()
 
 
-async def make_spin_gif(index):
+def spin_variants(key):
+    return list((SPIN_DIR / SPIN_VERSION / key).glob("*.gif"))
+
+
+async def draw_spin_gif(key, slot):
+    """Draw a fresh GIF for this prize, save it in the library and return its bytes."""
     async with spin_render_lock:
-        gif = await asyncio.to_thread(render_spin_gif, index)
-    return gif.getvalue()
+        gif = (await asyncio.to_thread(render_spin_gif, PRIZE_INDEX[key])).getvalue()
+    path = SPIN_DIR / SPIN_VERSION / key / f"{slot}.gif"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_bytes(gif)
+    tmp.replace(path)  # swap in whole, so a spin never reads a half-written file
+    return gif
 
 
-async def refill_spin_gif(index):
-    if index in spin_gifs or index in spin_refilling:
+async def fill_spin_library():
+    for old in SPIN_DIR.glob("*"):  # GIFs drawn by an older wheel.py
+        if old.name != SPIN_VERSION:
+            shutil.rmtree(old, ignore_errors=True)
+    drawn = 0
+    for slot in range(SPIN_VARIANTS):  # round by round, so every prize gets one early
+        for key in PRIZE_INDEX:
+            if not (SPIN_DIR / SPIN_VERSION / key / f"{slot}.gif").exists():
+                try:
+                    await draw_spin_gif(key, slot)
+                    drawn += 1
+                except Exception as e:
+                    print(f"Couldn't draw spin GIF {key}/{slot}: {e!r}")
+    print(f"Spin library ready ({drawn} new GIFs drawn)")
+
+
+async def refresh_spin_gif(key):
+    if spin_render_lock.locked():  # already drawing: skip rather than build a queue
         return
-    spin_refilling.add(index)
     try:
-        spin_gifs[index] = await make_spin_gif(index)
+        await draw_spin_gif(key, random.randrange(SPIN_VARIANTS))
     except Exception as e:
-        print(f"Couldn't pre-draw spin GIF {index}: {e!r}")
-    finally:
-        spin_refilling.discard(index)
-
-
-async def prepare_spin_gifs():
-    for index in range(len(PRIZES)):
-        await refill_spin_gif(index)
+        print(f"Couldn't refresh spin GIF {key}: {e!r}")
 
 
 def run_in_background(coro):
@@ -695,10 +719,12 @@ async def spin(interaction: discord.Interaction):
         balance = get_wallet(gid, uid)[0]
 
     await interaction.response.defer()
-    gif = spin_gifs.pop(index, None)
-    if gif is None:  # not ready yet, e.g. just after a restart
-        gif = await make_spin_gif(index)
-    run_in_background(refill_spin_gif(index))
+    variants = spin_variants(key)
+    if variants:
+        gif = await asyncio.to_thread(random.choice(variants).read_bytes)
+        run_in_background(refresh_spin_gif(key))
+    else:  # library still being drawn, e.g. right after wheel.py changed
+        gif = await draw_spin_gif(key, 0)
     who = interaction.user.mention
     msg = await interaction.followup.send(
         content=f"🎡 {who} 轉動了轉盤（{paid_with}）……",
