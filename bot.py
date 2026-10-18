@@ -10,7 +10,7 @@ import discord
 from discord import app_commands
 from dotenv import load_dotenv
 
-from stat_card import STYLES, price_text, render_shop_preview, render_stat_card
+from stat_card import STYLES, render_shop_preview, render_stat_card
 from wheel import PRIZES, STYLE_REFUND, render_spin_gif, roll
 
 load_dotenv()  # reads DISCORD_TOKEN from the .env file next to this script
@@ -212,13 +212,6 @@ async def on_message(message):
         return
     if any(t in message.content for t in TRIGGERS):
         await message.reply(REPLY)
-
-
-# ---------- Fun commands ----------
-
-@client.tree.command(name="duck", description="收到風")
-async def duck(interaction: discord.Interaction):
-    await interaction.response.send_message("收到風鵝鵝殺")
 
 
 # ---------- 10mix queue ----------
@@ -501,20 +494,7 @@ async def leaderboard(interaction: discord.Interaction):
 
 # ---------- Card style shop ----------
 
-BUY_CHOICES = [
-    app_commands.Choice(name=f"{label}（{price_text(price)}）", value=key)
-    for key, (label, price, _) in STYLES.items() if price is not None
-]
-STYLE_CHOICES = [
-    app_commands.Choice(name=label, value=key) for key, (label, _, _) in STYLES.items()
-]
-
-
-@client.tree.command(name="shop", description="戰績卡商店")
-@app_commands.guild_only()
-async def shop(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)  # only the person using it sees the shop
-    credits, equipped, owned = get_wallet(interaction.guild_id, interaction.user.id)
+def shop_embed(credits, equipped, owned, notice=None):
     lines = []
     for key, (label, price, _) in STYLES.items():
         if key == equipped:
@@ -526,59 +506,86 @@ async def shop(interaction: discord.Interaction):
         else:
             status = f"🪙 {price} 金幣"
         lines.append(f"**{label}**　{status}")
-    embed = discord.Embed(
-        title="🛒 戰績卡商店",
-        description="\n".join(lines) + f"\n\n你的金幣：**{credits:,}**\n用 /buy 購買，/style 更換已擁有的款式",
-        color=discord.Color.gold(),
-    )
+    description = "\n".join(lines) + f"\n\n你的金幣：**{credits:,}**\n按下面的按鈕購買或套用款式"
+    if notice:
+        description = f"{notice}\n\n{description}"
+    embed = discord.Embed(title="🛒 戰績卡商店", description=description, color=discord.Color.gold())
     embed.set_image(url="attachment://shop.png")
+    return embed
+
+
+class ShopView(discord.ui.View):
+    """Buttons under /shop: buy a style, or switch to one you already own."""
+
+    def __init__(self, interaction):
+        super().__init__(timeout=840)  # interaction tokens expire after 15 minutes
+        self.interaction = interaction
+        self.user_id = interaction.user.id
+
+    def refresh(self, credits, equipped, owned):
+        self.clear_items()
+        for key, (label, price, _) in STYLES.items():
+            if key == equipped:
+                button = discord.ui.Button(label=f"✅ {label}", style=discord.ButtonStyle.success, disabled=True)
+            elif key in owned:
+                button = discord.ui.Button(label=f"套用 {label}", style=discord.ButtonStyle.primary)
+            elif price is None:
+                button = discord.ui.Button(label=f"🎡 {label}", style=discord.ButtonStyle.secondary, disabled=True)
+            else:
+                button = discord.ui.Button(label=f"購買 {label}（{price}）", style=discord.ButtonStyle.secondary,
+                                           disabled=credits < price)
+            button.callback = self.make_callback(key)
+            self.add_item(button)
+
+    def make_callback(self, key):
+        async def callback(interaction: discord.Interaction):
+            await self.choose(interaction, key)
+        return callback
+
+    async def interaction_check(self, interaction: discord.Interaction):
+        return interaction.user.id == self.user_id
+
+    async def choose(self, interaction: discord.Interaction, key):
+        gid, uid = interaction.guild_id, interaction.user.id
+        credits, _, owned = get_wallet(gid, uid)
+        label, price, _ = STYLES[key]
+        if key in owned:
+            db.execute("UPDATE players SET style=? WHERE guild_id=? AND user_id=?", (key, gid, uid))
+            notice = f"✅ 已換成「{label}」款式。"
+        elif price is None:
+            notice = f"「{label}」只可以用 /spin 轉盤抽。"
+        elif credits < price:
+            notice = f"金幣不足：「{label}」需要 {price}，你只有 {credits}。"
+        else:
+            db.execute(
+                "UPDATE players SET credits = credits - ?, style = ? WHERE guild_id=? AND user_id=?",
+                (price, key, gid, uid),
+            )
+            db.execute("INSERT INTO owned_styles (guild_id, user_id, style) VALUES (?, ?, ?)", (gid, uid, key))
+            notice = f"🎉 你購買了「{label}」並已套用！"
+        db.commit()
+        credits, equipped, owned = get_wallet(gid, uid)
+        self.refresh(credits, equipped, owned)
+        self.interaction = interaction
+        await interaction.response.edit_message(embed=shop_embed(credits, equipped, owned, notice), view=self)
+
+    async def on_timeout(self):
+        try:
+            await self.interaction.edit_original_response(view=None)
+        except discord.HTTPException:
+            pass
+
+
+@client.tree.command(name="shop", description="戰績卡商店：購買或更換戰績卡款式")
+@app_commands.guild_only()
+async def shop(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)  # only the person using it sees the shop
+    credits, equipped, owned = get_wallet(interaction.guild_id, interaction.user.id)
+    view = ShopView(interaction)
+    view.refresh(credits, equipped, owned)
     png = await asyncio.to_thread(render_shop_preview)
-    await interaction.followup.send(embed=embed, file=discord.File(png, filename="shop.png"), ephemeral=True)
-
-
-@client.tree.command(name="buy", description="購買戰績卡款式")
-@app_commands.guild_only()
-@app_commands.describe(style="要購買的款式")
-@app_commands.choices(style=BUY_CHOICES)
-async def buy(interaction: discord.Interaction, style: app_commands.Choice[str]):
-    gid, uid = interaction.guild_id, interaction.user.id
-    credits, _, owned = get_wallet(gid, uid)
-    label, price, _ = STYLES[style.value]
-    if style.value in owned:
-        await interaction.response.send_message(f"你已經擁有「{label}」，用 /style 更換。", ephemeral=True)
-        return
-    if credits < price:
-        await interaction.response.send_message(
-            f"金幣不足：「{label}」需要 {price}，你只有 {credits}。", ephemeral=True
-        )
-        return
-    db.execute(
-        "UPDATE players SET credits = credits - ?, style = ? WHERE guild_id=? AND user_id=?",
-        (price, style.value, gid, uid),
-    )
-    db.execute("INSERT INTO owned_styles (guild_id, user_id, style) VALUES (?, ?, ?)", (gid, uid, style.value))
-    db.commit()
-    await interaction.response.send_message(
-        f"🎉 你購買了「{label}」並已套用！剩餘金幣：{credits - price}",
-        ephemeral=True,
-    )
-
-
-@client.tree.command(name="style", description="更換戰績卡款式")
-@app_commands.guild_only()
-@app_commands.describe(style="要使用的款式")
-@app_commands.choices(style=STYLE_CHOICES)
-async def style_cmd(interaction: discord.Interaction, style: app_commands.Choice[str]):
-    gid, uid = interaction.guild_id, interaction.user.id
-    _, _, owned = get_wallet(gid, uid)
-    label = STYLES[style.value][0]
-    if style.value not in owned:
-        how = "用 /spin 轉盤抽" if STYLES[style.value][1] is None else "先用 /buy 購買"
-        await interaction.response.send_message(f"你還沒有「{label}」，{how}。", ephemeral=True)
-        return
-    db.execute("UPDATE players SET style=? WHERE guild_id=? AND user_id=?", (style.value, gid, uid))
-    db.commit()
-    await interaction.response.send_message(f"已換成「{label}」款式。", ephemeral=True)
+    await interaction.followup.send(embed=shop_embed(credits, equipped, owned), view=view,
+                                    file=discord.File(png, filename="shop.png"), ephemeral=True)
 
 
 # ---------- Lucky wheel ----------
@@ -645,7 +652,7 @@ async def spin(interaction: discord.Interaction):
                 result = f"🌈 **超級 JACKPOT！** 抽中「{style_label}」，但你已經擁有，換成 **{STYLE_REFUND} 金幣**！"
             else:
                 db.execute("INSERT INTO owned_styles (guild_id, user_id, style) VALUES (?, ?, ?)", (gid, uid, value))
-                result = f"🌈 **超級 JACKPOT！！** 抽中限定卡面「**{style_label}**」！用 /style 套用"
+                result = f"🌈 **超級 JACKPOT！！** 抽中限定卡面「**{style_label}**」！用 /shop 套用"
         db.commit()
         balance = get_wallet(gid, uid)[0]
 
