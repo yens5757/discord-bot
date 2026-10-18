@@ -600,10 +600,15 @@ spin_lock = asyncio.Lock()
 # /spin sends a random one for the rolled prize, then redraws one in the background
 # so the library slowly changes. The version is a fingerprint of wheel.py: edit the
 # wheel or its prizes and the old GIFs are thrown away and redrawn automatically.
-SPIN_VARIANTS = 10                 # GIFs kept per prize
+SPIN_LIBRARY_SIZE = 80            # GIFs kept in total, shared out by each prize's chance
 SPIN_DIR = Path(__file__).with_name("spin_gifs")
 SPIN_VERSION = hashlib.sha1(Path(__file__).with_name("wheel.py").read_bytes()).hexdigest()[:12]
 PRIZE_INDEX = {p[0]: i for i, p in enumerate(PRIZES)}
+# common prizes are seen often, so they get more versions (repeats are less noticeable);
+# rare ones still get 2
+SPIN_VARIANTS = {
+    p[0]: max(2, round(SPIN_LIBRARY_SIZE * p[2] / sum(q[2] for q in PRIZES))) for p in PRIZES
+}
 spin_render_lock = asyncio.Lock()  # draw one GIF at a time: the server's CPU is small
 background_tasks = set()
 
@@ -628,10 +633,14 @@ async def fill_spin_library():
     for old in SPIN_DIR.glob("*"):  # GIFs drawn by an older wheel.py
         if old.name != SPIN_VERSION:
             shutil.rmtree(old, ignore_errors=True)
+    for key, count in SPIN_VARIANTS.items():  # extra GIFs from when a prize was allowed more
+        for path in spin_variants(key):
+            if not path.stem.isdigit() or int(path.stem) >= count:
+                path.unlink(missing_ok=True)
     drawn = 0
-    for slot in range(SPIN_VARIANTS):  # round by round, so every prize gets one early
-        for key in PRIZE_INDEX:
-            if not (SPIN_DIR / SPIN_VERSION / key / f"{slot}.gif").exists():
+    for slot in range(max(SPIN_VARIANTS.values())):  # round by round, so every prize gets one early
+        for key, count in SPIN_VARIANTS.items():
+            if slot < count and not (SPIN_DIR / SPIN_VERSION / key / f"{slot}.gif").exists():
                 try:
                     await draw_spin_gif(key, slot)
                     drawn += 1
@@ -644,7 +653,7 @@ async def refresh_spin_gif(key):
     if spin_render_lock.locked():  # already drawing: skip rather than build a queue
         return
     try:
-        await draw_spin_gif(key, random.randrange(SPIN_VARIANTS))
+        await draw_spin_gif(key, random.randrange(SPIN_VARIANTS[key]))
     except Exception as e:
         print(f"Couldn't refresh spin GIF {key}: {e!r}")
 
