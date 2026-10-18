@@ -13,12 +13,13 @@ from pathlib import Path
 import discord
 from discord import app_commands
 from dotenv import load_dotenv
+from PIL import Image
 
 import champions
 import wheel
 from reel import SECONDS as REEL_SECONDS
 from reel import render_reel_gif, render_reel_preview
-from stat_card import STYLES, render_shop_preview, render_stat_card
+from stat_card import STYLES, render_card_image, render_shop_preview, render_stat_card
 from wheel import PRIZES, STYLE_REFUND, render_spin_gif, roll
 
 load_dotenv()  # reads DISCORD_TOKEN from the .env file next to this script
@@ -513,9 +514,53 @@ CHAMP_SPIN_COST = 300  # 英雄卡轉盤: always a champion card you don't own y
 
 
 async def prepare_shop():
+    for old in CARD_PREVIEW_DIR.glob("*"):  # previews drawn by an older card design
+        if old.name != CARD_PREVIEW_VERSION:
+            shutil.rmtree(old, ignore_errors=True)
     await asyncio.to_thread(champions.load_list)
     await asyncio.to_thread(render_shop_preview)  # draw it once now, so the buy page opens quickly
     await asyncio.to_thread(champions.download_all)
+
+
+# Generic previews of each card (placeholder name and stats), drawn once and kept on disk.
+# The version is a fingerprint of the card-drawing code, so a redesign redraws them.
+CARD_PREVIEW_DIR = Path(__file__).with_name("card_previews")
+CARD_PREVIEW_VERSION = hashlib.sha1(b"".join(
+    Path(__file__).with_name(f).read_bytes() for f in ("stat_card.py", "regions.py", "champions.py")
+)).hexdigest()[:12]
+card_render_lock = asyncio.Lock()  # one preview at a time, so scrolling through cards can't pile up work
+
+
+def card_preview_path(style):
+    return CARD_PREVIEW_DIR / CARD_PREVIEW_VERSION / f"{style.replace(':', '_')}.png"
+
+
+def draw_card_preview(style):
+    img = render_card_image("預覽", None, 1200, 520, (20, 12), (10, 6), card_theme(style))
+    path = card_preview_path(style)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    img.convert("RGB").resize((900, 500), Image.LANCZOS).save(tmp, "PNG", optimize=True)
+    tmp.replace(path)
+
+
+async def card_preview(style):
+    """PNG bytes of the card's generic preview; drawn the first time it's needed."""
+    path = card_preview_path(style)
+    if not path.exists():
+        async with card_render_lock:
+            if not path.exists():  # someone else may have drawn it while we waited
+                await asyncio.to_thread(draw_card_preview, style)
+    return path.read_bytes()
+
+
+async def attach_card(msg, preview):
+    """Add the won card's preview under the spin animation. `preview` = task drawing it."""
+    try:
+        png = await preview
+        await msg.edit(attachments=[*msg.attachments, discord.File(io.BytesIO(png), filename="card.png")])
+    except Exception as e:
+        print(f"Couldn't attach card preview: {e!r}")
 
 
 def card_label(style):
@@ -597,6 +642,7 @@ class ShopView(MenuView):
     def __init__(self, interaction):
         super().__init__(interaction)
         self.switch_page = 0
+        self.selected = None  # card picked in 更換卡面, previewed before applying
 
     def build(self, gid, uid, notice=None):
         credits, equipped, owned = get_wallet(gid, uid)
@@ -635,19 +681,29 @@ class ShopView(MenuView):
             pages = max(1, -(-len(cards) // self.PER_PAGE))
             self.switch_page = min(self.switch_page, pages - 1)
             shown = cards[self.switch_page * self.PER_PAGE:(self.switch_page + 1) * self.PER_PAGE]
+            picked = self.selected if self.selected in owned else None
             embed.title = "🎨 更換卡面"
             embed.description = (f"目前卡面：**{card_label(equipped)}**\n已擁有 {len(cards)} 款"
-                                 f"（英雄卡 {collected}/{total}）\n在下面選擇要使用的卡面")
+                                 f"（英雄卡 {collected}/{total}）\n")
+            if picked:
+                embed.description += f"預覽：**{card_label(picked)}**"
+                embed.set_image(url="attachment://card.png")
+            else:
+                embed.description += "在下面選擇卡面，可以先預覽再套用"
             select = discord.ui.Select(
                 placeholder=f"選擇卡面（第 {self.switch_page + 1}/{pages} 頁）",
                 options=[discord.SelectOption(
-                    label=card_label(k), value=k, default=k == equipped,
+                    label=card_label(k), value=k, default=k == (picked or equipped),
                     description=(champions.CHAMPIONS.get(champions.champion_id(k), {}).get("title")
                                  if champions.is_champion(k) else "基本款式") or None,
                 ) for k in shown],
             )
-            select.callback = self.equip
+            select.callback = self.pick
             self.add_item(select)
+            if picked:
+                in_use = picked == equipped
+                self.button("✅ 使用中" if in_use else f"✅ 套用「{card_label(picked)}」", self.equip,
+                            discord.ButtonStyle.success, disabled=in_use, row=1)
             if pages > 1:
                 self.button("◀", self.turn(-1), disabled=self.switch_page == 0, row=1)
                 self.button("▶", self.turn(1), disabled=self.switch_page >= pages - 1, row=1)
@@ -660,6 +716,8 @@ class ShopView(MenuView):
     async def image(self):
         if self.page == "buy":
             return discord.File(await asyncio.to_thread(render_shop_preview), filename="shop.png")
+        if self.page == "switch" and self.selected:
+            return discord.File(io.BytesIO(await card_preview(self.selected)), filename="card.png")
         return None
 
     def turn(self, step):
@@ -668,8 +726,13 @@ class ShopView(MenuView):
             await self.show(interaction)
         return callback
 
+    async def pick(self, interaction):
+        """Choosing a card in the dropdown shows its preview; 套用 then equips it."""
+        self.selected = interaction.data["values"][0]
+        await self.show(interaction)
+
     async def equip(self, interaction):
-        key = interaction.data["values"][0]
+        key = self.selected
         gid, uid = interaction.guild_id, interaction.user.id
         if key in get_wallet(gid, uid)[2]:
             db.execute("UPDATE players SET style=? WHERE guild_id=? AND user_id=?", (key, gid, uid))
@@ -901,6 +964,7 @@ class SpinView(MenuView):
                            (SPIN_COST, gid, uid))
 
             # draw the prize and apply it
+            won_card = None
             index = roll()
             key, label, _, kind, value = PRIZES[index]
             if kind == "coins":
@@ -923,6 +987,7 @@ class SpinView(MenuView):
                     result = f"🌈 **超級 JACKPOT！** 抽中「{style_label}」，但你已經擁有，換成 **{STYLE_REFUND} 金幣**！"
                 else:
                     db.execute("INSERT INTO owned_styles (guild_id, user_id, style) VALUES (?, ?, ?)", (gid, uid, value))
+                    won_card = value
                     result = f"🌈 **超級 JACKPOT！！** 抽中限定卡面「**{style_label}**」！用 /shop →「更換卡面」套用"
             db.commit()
             balance = get_wallet(gid, uid)[0]
@@ -940,8 +1005,11 @@ class SpinView(MenuView):
             file=discord.File(io.BytesIO(gif), filename="spin.gif"),
             wait=True,
         )
+        preview = asyncio.create_task(card_preview(won_card)) if won_card else None  # drawn while the wheel spins
         await asyncio.sleep(2.6)  # let the wheel stop before revealing the result
         await msg.edit(content=f"🎡 {who} 轉動了幸運轉盤（{paid_with}）\n{result}\n剩餘金幣：{balance:,}")
+        if preview:
+            await attach_card(msg, preview)
 
     async def champion_spin(self, interaction):
         gid, uid = interaction.guild_id, interaction.user.id
@@ -969,11 +1037,13 @@ class SpinView(MenuView):
         start = f"🎰 {who} 抽英雄卡（{paid}）"
         msg = await interaction.followup.send(content=f"{start}……", file=discord.File(gif, filename="champion.gif"),
                                               wait=True)
+        preview = asyncio.create_task(card_preview(champions.style_key(cid)))  # drawn while the reel plays
         await asyncio.sleep(REEL_SECONDS)
         info = champions.CHAMPIONS[cid]
         collected = sum(champions.is_champion(k) for k in get_wallet(gid, uid)[2])
         await msg.edit(content=f"{start}\n✨ 獲得英雄卡「**{info['name']}**」{info['title']}！"
                                f"（已收集 {collected}/{len(champions.CHAMPIONS)}）\n用 /shop →「更換卡面」套用")
+        await attach_card(msg, preview)
 
 
 @client.tree.command(name="spin", description="轉盤：幸運轉盤（每日免費）或英雄卡轉盤")
