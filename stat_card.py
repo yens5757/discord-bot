@@ -6,7 +6,7 @@ from functools import lru_cache
 from io import BytesIO
 from pathlib import Path
 
-from PIL import Image, ImageDraw, ImageFilter, ImageFont
+from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont
 
 S = 2                    # render at 2x so the card looks sharp in Discord
 W, H = 900, 500          # card size before scaling
@@ -423,17 +423,72 @@ def foreground_fx(img, fx, panels):
         gradient_outline(img, (6, 6, W - 6, H - 6), lambda t: lerp((255, 90, 70), (140, 20, 40), abs(t * 2 - 1)), 3, 22)
 
 
+# ---------- Champion cards (colours and art come from champions.theme) ----------
+
+ART_BOX = (330, 0, W, 330)  # right side of the header; the panels cover the bottom part
+
+
+def header_art(img, t, zoom=0.74, brightness=0.82):
+    """Champion splash in the right of the header, fading out towards the name and the panels."""
+    x0, y0, x1, y1 = ART_BOX
+    bw, bh = (x1 - x0) * S, (y1 - y0) * S
+    src = Image.open(t["art"]).convert("RGB")
+    fx_, fy = t["focus"]
+    cw = src.width * zoom
+    ch = cw * bh / bw
+    left = min(max(fx_ * src.width - cw * 0.5, 0), src.width - cw)
+    top = min(max(fy * src.height - ch * 0.3, 0), src.height - ch)
+    pic = src.resize((bw, bh), Image.LANCZOS, box=(left, top, left + cw, top + ch))
+    pic = ImageEnhance.Brightness(pic).enhance(brightness).convert("RGBA")
+
+    fade = Image.new("L", (bw, bh), 0)
+    fd = ImageDraw.Draw(fade)
+    for x in range(bw):  # fade in from the left, out above the panels
+        fd.line([(x, 0), (x, bh)], fill=round(255 * min(1, x / (150 * S)) ** 1.4))
+    bottom = Image.new("L", (bw, bh), 0)
+    bd = ImageDraw.Draw(bottom)
+    for y in range(bh):
+        bd.line([(0, y), (bw, y)], fill=round(255 * min(1, max(0, (225 * S - y) / (45 * S)))))
+    pic.putalpha(Image.composite(fade, Image.new("L", (bw, bh), 0), bottom))
+    img.alpha_composite(pic, s(x0, y0))
+
+    shade = Image.new("RGBA", img.size, (0, 0, 0, 0))  # keeps the ELO number readable
+    ImageDraw.Draw(shade).ellipse(s(W - 300, 10, W + 20, 200), fill=(0, 0, 0, 165))
+    img.alpha_composite(shade.filter(ImageFilter.GaussianBlur(28 * S)))
+
+
+def champion_foreground(img, t, panels):
+    edge_at = lambda k: grad_color([t["accent"][1], t["flex"], t["accent"][1]], k)  # noqa: E731
+    for box in panels:
+        gradient_outline(img, box, edge_at, 1.5, 18, repeats=1.2)
+    gradient_outline(img, (6, 6, W - 6, H - 6), edge_at, 4, 22, repeats=1.5)
+
+    d = ImageDraw.Draw(img)
+    f = font("bold", 16)
+    x, y = 206 + d.textlength("個人戰績", font=font("regular", 20)) / S + 12, 128
+    tw = d.textlength(t["champ_name"], font=f) / S
+    box = (x, y - 14, x + tw + 26, y + 14)
+    d.rounded_rectangle(s(*box), radius=14 * S, fill=t["accent"][1])
+    d.text(s(x + 13 + tw / 2, y), t["champ_name"], font=f, fill=(20, 18, 24), anchor="mm")
+    d.text(s(W - 40, 482), t["champ_title"], font=font("bold", 14), fill=t["muted"], anchor="rm")
+
+
 # ---------- Public functions ----------
 
 def render_card_image(name, avatar_bytes, elo, credits, mix, flex, style="dark"):
-    """Returns the card as a PIL image. mix / flex = (games, wins)."""
-    t = STYLES.get(style, STYLES["dark"])[2]
+    """Returns the card as a PIL image. mix / flex = (games, wins).
+    style is a key of STYLES, or a ready-made colour dict (champion cards)."""
+    t = style if isinstance(style, dict) else STYLES.get(style, STYLES["dark"])[2]
     fx = t.get("fx")
     img = Image.new("RGBA", s(W, H))
     bg = ImageDraw.Draw(img)
     for row in range(H * S):
         bg.line([(0, row), (W * S, row)], fill=lerp(*t["bg"], row / (H * S)))
-    background_fx(img, fx)
+    if fx == "champion":
+        if t["art"]:
+            header_art(img, t)
+    else:
+        background_fx(img, fx)
     glow(img, (W - 80, 40), 180, t["glows"][0], t["glow_alpha"])
     glow(img, (60, H), 200, t["glows"][1], t["glow_alpha"] - 10)
 
@@ -485,7 +540,10 @@ def render_card_image(name, avatar_bytes, elo, credits, mix, flex, style="dark")
     panels = [(40, 205, 40 + pw, 465), (40 + pw + 24, 205, 40 + 2 * pw + 24, 465)]
     mode_panel(img, 40, 205, pw, 260, "10mix", t["mix"], *mix, t)
     mode_panel(img, 40 + pw + 24, 205, pw, 260, "Flex", t["flex"], *flex, t)
-    foreground_fx(img, fx, panels)
+    if fx == "champion":
+        champion_foreground(img, t, panels)
+    else:
+        foreground_fx(img, fx, panels)
     return img
 
 

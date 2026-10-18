@@ -28,7 +28,14 @@
 ### 金幣與卡面
 - 每人起始 100 金幣
 - 每場比賽（10mix 及 Flex）：贏 +20 金幣，輸 +5 金幣
-- `/shop`：查看所有戰績卡及價錢，按下面的按鈕直接購買或套用卡面（只有自己看到）
+- `/shop`：戰績卡商店（只有自己看到），有兩個按鈕：
+  - 🛒 **購買**：買基本卡面，或者玩 🎰 **英雄卡轉盤**
+  - 🎨 **更換卡面**：喺下拉選單揀你擁有嘅卡面套用
+
+### 英雄卡
+- 每位 League of Legends 英雄（現時 173 位）都有一張專屬戰績卡：用英雄原畫、英雄名同稱號，顏色按原畫自動配搭
+- 🎰 英雄卡轉盤：每次 300 金幣，**必定抽到你未擁有嘅英雄卡**，抽卡動畫會發送到頻道
+- 新英雄推出後會自動加入
 
 | 卡面 | 價錢 | 特效 |
 |---|---|---|
@@ -85,3 +92,7 @@
    ```
 
 戰績卡需要中文字型：Windows 會用微軟正黑體，macOS 用蘋方，Linux 需要安裝 Noto Sans CJK。
+
+---
+
+收網機械人 isn't endorsed by Riot Games and doesn't reflect the views or opinions of Riot Games or anyone officially involved in producing or managing Riot Games properties. Riot Games, and all associated properties are trademarks or registered trademarks of Riot Games, Inc.

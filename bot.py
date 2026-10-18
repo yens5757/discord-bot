@@ -13,6 +13,9 @@ import discord
 from discord import app_commands
 from dotenv import load_dotenv
 
+import champions
+from reel import SECONDS as REEL_SECONDS
+from reel import render_reel_gif
 from stat_card import STYLES, render_shop_preview, render_stat_card
 from wheel import PRIZES, STYLE_REFUND, render_spin_gif, roll
 
@@ -198,6 +201,7 @@ class Bot(discord.Client):
         synced = await self.tree.sync()
         print(f"Synced {len(synced)} slash commands")
         run_in_background(fill_spin_library())
+        run_in_background(prepare_shop())
 
 
 client = Bot()
@@ -471,7 +475,7 @@ async def stat(interaction: discord.Interaction, user: discord.Member = None):
 
     credits, style, _ = get_wallet(gid, user.id)
     png = await asyncio.to_thread(
-        render_stat_card, user.display_name, avatar, rating, credits, mix, flex, style
+        lambda: render_stat_card(user.display_name, avatar, rating, credits, mix, flex, card_theme(style))
     )
     await interaction.followup.send(file=discord.File(png, filename="stat.png"))
 
@@ -498,80 +502,197 @@ async def leaderboard(interaction: discord.Interaction):
 
 # ---------- Card style shop ----------
 
-def shop_embed(credits, equipped, owned, notice=None):
-    lines = []
-    for key, (label, price, _) in STYLES.items():
-        if key == equipped:
-            status = "✅ 使用中"
-        elif key in owned:
-            status = "已擁有"
-        elif price is None:
-            status = "🎡 轉盤限定"
-        else:
-            status = f"🪙 {price} 金幣"
-        lines.append(f"**{label}**　{status}")
-    description = "\n".join(lines) + f"\n\n你的金幣：**{credits:,}**\n按下面的按鈕購買或套用款式"
-    if notice:
-        description = f"{notice}\n\n{description}"
-    embed = discord.Embed(title="🛒 戰績卡商店", description=description, color=discord.Color.gold())
-    embed.set_image(url="attachment://shop.png")
-    return embed
+CHAMP_SPIN_COST = 300  # 英雄卡轉盤: always a champion card you don't own yet
+
+
+async def prepare_shop():
+    await asyncio.to_thread(champions.load_list)
+    await asyncio.to_thread(render_shop_preview)  # draw it once now, so the buy page opens quickly
+    await asyncio.to_thread(champions.download_all)
+
+
+def card_label(style):
+    if champions.is_champion(style):
+        return champions.label(style)
+    return STYLES.get(style, STYLES["dark"])[0]
+
+
+def card_theme(style):
+    """What render_stat_card needs: a STYLES key, or the colours of a champion card."""
+    return champions.theme(style) if champions.is_champion(style) else style
+
+
+def owned_cards(owned):
+    """Basic styles first (in shop order), then champions by name."""
+    basic = [k for k in STYLES if k in owned]
+    champs = sorted((k for k in owned if champions.is_champion(k)), key=champions.label)
+    return basic + champs
 
 
 class ShopView(discord.ui.View):
-    """Buttons under /shop: buy a style, or switch to one you already own."""
+    """/shop: a home page with 購買 and 更換卡面, the buy page (styles + 英雄卡轉盤), and the card switcher."""
+
+    PER_PAGE = 25  # Discord's limit for one dropdown
 
     def __init__(self, interaction):
         super().__init__(timeout=840)  # interaction tokens expire after 15 minutes
         self.interaction = interaction
         self.user_id = interaction.user.id
-
-    def refresh(self, credits, equipped, owned):
-        self.clear_items()
-        for key, (label, price, _) in STYLES.items():
-            if key == equipped:
-                button = discord.ui.Button(label=f"✅ {label}", style=discord.ButtonStyle.success, disabled=True)
-            elif key in owned:
-                button = discord.ui.Button(label=f"套用 {label}", style=discord.ButtonStyle.primary)
-            elif price is None:
-                button = discord.ui.Button(label=f"🎡 {label}", style=discord.ButtonStyle.secondary, disabled=True)
-            else:
-                button = discord.ui.Button(label=f"購買 {label}（{price}）", style=discord.ButtonStyle.secondary,
-                                           disabled=credits < price)
-            button.callback = self.make_callback(key)
-            self.add_item(button)
-
-    def make_callback(self, key):
-        async def callback(interaction: discord.Interaction):
-            await self.choose(interaction, key)
-        return callback
+        self.page = "home"
+        self.switch_page = 0
 
     async def interaction_check(self, interaction: discord.Interaction):
         return interaction.user.id == self.user_id
 
-    async def choose(self, interaction: discord.Interaction, key):
-        gid, uid = interaction.guild_id, interaction.user.id
-        credits, _, owned = get_wallet(gid, uid)
-        label, price, _ = STYLES[key]
-        if key in owned:
-            db.execute("UPDATE players SET style=? WHERE guild_id=? AND user_id=?", (key, gid, uid))
-            notice = f"✅ 已換成「{label}」款式。"
-        elif price is None:
-            notice = f"「{label}」只可以用 /spin 轉盤抽。"
-        elif credits < price:
-            notice = f"金幣不足：「{label}」需要 {price}，你只有 {credits}。"
-        else:
-            db.execute(
-                "UPDATE players SET credits = credits - ?, style = ? WHERE guild_id=? AND user_id=?",
-                (price, key, gid, uid),
-            )
-            db.execute("INSERT INTO owned_styles (guild_id, user_id, style) VALUES (?, ?, ?)", (gid, uid, key))
-            notice = f"🎉 你購買了「{label}」並已套用！"
-        db.commit()
+    def button(self, label, callback, style=discord.ButtonStyle.secondary, disabled=False, row=None):
+        b = discord.ui.Button(label=label, style=style, disabled=disabled, row=row)
+        b.callback = callback
+        self.add_item(b)
+
+    def go(self, page):
+        async def callback(interaction):
+            await self.show(interaction, page)
+        return callback
+
+    def build(self, gid, uid, notice=None):
+        """Lay out the current page: returns its embed and sets the buttons."""
         credits, equipped, owned = get_wallet(gid, uid)
-        self.refresh(credits, equipped, owned)
+        collected = sum(champions.is_champion(k) for k in owned)
+        total = len(champions.CHAMPIONS)
+        self.clear_items()
+        embed = discord.Embed(color=discord.Color.gold())
+
+        if self.page == "home":
+            embed.title = "🛒 戰績卡商店"
+            embed.description = (f"你的金幣：**{credits:,}**\n目前卡面：**{card_label(equipped)}**\n"
+                                 f"英雄卡：已收集 **{collected}/{total}**")
+            self.button("🛒 購買", self.go("buy"), discord.ButtonStyle.primary)
+            self.button("🎨 更換卡面", self.go("switch"), discord.ButtonStyle.success)
+
+        elif self.page == "buy":
+            lines = []
+            for key, (label, price, _) in STYLES.items():
+                status = "已擁有" if key in owned else "🎡 /spin 轉盤限定" if price is None else f"🪙 {price} 金幣"
+                lines.append(f"**{label}**　{status}")
+            lines.append(f"\n🎰 **英雄卡轉盤**　🪙 {CHAMP_SPIN_COST} 金幣\n必定抽到未擁有的英雄卡（已收集 {collected}/{total}）")
+            embed.title = "🛒 購買"
+            embed.description = "\n".join(lines) + f"\n\n你的金幣：**{credits:,}**"
+            embed.set_image(url="attachment://shop.png")
+            for key, (label, price, _) in STYLES.items():
+                if price is None or price == 0:
+                    continue
+                if key in owned:
+                    self.button(f"✅ {label}", self.buy(key), disabled=True)
+                else:
+                    self.button(f"購買 {label}（{price}）", self.buy(key), disabled=credits < price)
+            self.button(f"🎰 英雄卡轉盤（{CHAMP_SPIN_COST}）", self.champion_spin, discord.ButtonStyle.success,
+                        disabled=credits < CHAMP_SPIN_COST or collected >= total, row=2)
+            self.button("⬅ 返回", self.go("home"), row=2)
+
+        else:  # switch
+            cards = owned_cards(owned)
+            pages = max(1, -(-len(cards) // self.PER_PAGE))
+            self.switch_page = min(self.switch_page, pages - 1)
+            shown = cards[self.switch_page * self.PER_PAGE:(self.switch_page + 1) * self.PER_PAGE]
+            embed.title = "🎨 更換卡面"
+            embed.description = (f"目前卡面：**{card_label(equipped)}**\n已擁有 {len(cards)} 款"
+                                 f"（英雄卡 {collected}/{total}）\n在下面選擇要使用的卡面")
+            select = discord.ui.Select(
+                placeholder=f"選擇卡面（第 {self.switch_page + 1}/{pages} 頁）",
+                options=[discord.SelectOption(
+                    label=card_label(k), value=k, default=k == equipped,
+                    description=(champions.CHAMPIONS.get(champions.champion_id(k), {}).get("title")
+                                 if champions.is_champion(k) else "基本款式") or None,
+                ) for k in shown],
+            )
+            select.callback = self.equip
+            self.add_item(select)
+            if pages > 1:
+                self.button("◀", self.turn(-1), disabled=self.switch_page == 0, row=1)
+                self.button("▶", self.turn(1), disabled=self.switch_page >= pages - 1, row=1)
+            self.button("⬅ 返回", self.go("home"), row=1)
+
+        if notice:
+            embed.description = f"{notice}\n\n{embed.description}"
+        return embed
+
+    async def show(self, interaction, page=None, notice=None):
+        if page:
+            self.page = page
         self.interaction = interaction
-        await interaction.response.edit_message(embed=shop_embed(credits, equipped, owned, notice), view=self)
+        if not interaction.response.is_done():
+            await interaction.response.defer()
+        embed = self.build(interaction.guild_id, interaction.user.id, notice)
+        files = []
+        if self.page == "buy":
+            files = [discord.File(await asyncio.to_thread(render_shop_preview), filename="shop.png")]
+        await interaction.edit_original_response(embed=embed, view=self, attachments=files)
+
+    def turn(self, step):
+        async def callback(interaction):
+            self.switch_page += step
+            await self.show(interaction)
+        return callback
+
+    async def equip(self, interaction):
+        key = interaction.data["values"][0]
+        gid, uid = interaction.guild_id, interaction.user.id
+        if key in get_wallet(gid, uid)[2]:
+            db.execute("UPDATE players SET style=? WHERE guild_id=? AND user_id=?", (key, gid, uid))
+            db.commit()
+            notice = f"✅ 已換成「{card_label(key)}」卡面，用 /stat 睇吓！"
+        else:
+            notice = "你還沒有這款卡面。"
+        await self.show(interaction, notice=notice)
+
+    def buy(self, key):
+        async def callback(interaction):
+            gid, uid = interaction.guild_id, interaction.user.id
+            credits, _, owned = get_wallet(gid, uid)
+            label, price, _ = STYLES[key]
+            if key in owned:
+                notice = f"你已經擁有「{label}」。"
+            elif credits < price:
+                notice = f"金幣不足：「{label}」需要 {price}，你只有 {credits}。"
+            else:
+                db.execute(
+                    "UPDATE players SET credits = credits - ?, style = ? WHERE guild_id=? AND user_id=?",
+                    (price, key, gid, uid),
+                )
+                db.execute("INSERT INTO owned_styles (guild_id, user_id, style) VALUES (?, ?, ?)", (gid, uid, key))
+                db.commit()
+                notice = f"🎉 你購買了「{label}」並已套用！"
+            await self.show(interaction, notice=notice)
+        return callback
+
+    async def champion_spin(self, interaction):
+        gid, uid = interaction.guild_id, interaction.user.id
+        async with spin_lock:  # stops double-spending if someone spams the button
+            credits, _, owned = get_wallet(gid, uid)
+            unowned = [c for c in champions.CHAMPIONS if champions.style_key(c) not in owned]
+            if not unowned or credits < CHAMP_SPIN_COST:
+                notice = "你已經集齊所有英雄卡！" if not unowned else f"金幣不足：需要 {CHAMP_SPIN_COST}，你只有 {credits}。"
+                await self.show(interaction, notice=notice)
+                return
+            cid = random.choice(unowned)
+            db.execute("UPDATE players SET credits = credits - ? WHERE guild_id=? AND user_id=?",
+                       (CHAMP_SPIN_COST, gid, uid))
+            db.execute("INSERT INTO owned_styles (guild_id, user_id, style) VALUES (?, ?, ?)",
+                       (gid, uid, champions.style_key(cid)))
+            db.commit()
+        await self.show(interaction, notice=f"🎰 已扣 {CHAMP_SPIN_COST} 金幣，抽卡結果請看頻道！")
+
+        async with spin_render_lock:
+            gif = await asyncio.to_thread(render_reel_gif, cid, list(champions.CHAMPIONS))
+        who = interaction.user.mention
+        start = f"🎰 {who} 抽英雄卡（{CHAMP_SPIN_COST} 金幣）"
+        msg = await interaction.followup.send(content=f"{start}……", file=discord.File(gif, filename="champion.gif"),
+                                              wait=True)
+        await asyncio.sleep(REEL_SECONDS)
+        info = champions.CHAMPIONS[cid]
+        collected = sum(champions.is_champion(k) for k in get_wallet(gid, uid)[2])
+        await msg.edit(content=f"{start}\n✨ 獲得英雄卡「**{info['name']}**」{info['title']}！"
+                               f"（已收集 {collected}/{len(champions.CHAMPIONS)}）\n用 /shop →「更換卡面」套用")
 
     async def on_timeout(self):
         try:
@@ -580,16 +701,13 @@ class ShopView(discord.ui.View):
             pass
 
 
-@client.tree.command(name="shop", description="戰績卡商店：購買或更換戰績卡款式")
+@client.tree.command(name="shop", description="戰績卡商店：購買卡面、英雄卡轉盤、更換卡面")
 @app_commands.guild_only()
 async def shop(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)  # only the person using it sees the shop
-    credits, equipped, owned = get_wallet(interaction.guild_id, interaction.user.id)
     view = ShopView(interaction)
-    view.refresh(credits, equipped, owned)
-    png = await asyncio.to_thread(render_shop_preview)
-    await interaction.followup.send(embed=shop_embed(credits, equipped, owned), view=view,
-                                    file=discord.File(png, filename="shop.png"), ephemeral=True)
+    embed = view.build(interaction.guild_id, interaction.user.id)
+    await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
 
 # ---------- Lucky wheel ----------
@@ -726,7 +844,7 @@ async def spin(interaction: discord.Interaction):
                 result = f"🌈 **超級 JACKPOT！** 抽中「{style_label}」，但你已經擁有，換成 **{STYLE_REFUND} 金幣**！"
             else:
                 db.execute("INSERT INTO owned_styles (guild_id, user_id, style) VALUES (?, ?, ?)", (gid, uid, value))
-                result = f"🌈 **超級 JACKPOT！！** 抽中限定卡面「**{style_label}**」！用 /shop 套用"
+                result = f"🌈 **超級 JACKPOT！！** 抽中限定卡面「**{style_label}**」！用 /shop →「更換卡面」套用"
         db.commit()
         balance = get_wallet(gid, uid)[0]
 
