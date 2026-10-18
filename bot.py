@@ -712,8 +712,11 @@ async def spin(interaction: discord.Interaction):
             if key == "jackpot":
                 result = f"💰 **JACKPOT！** 獲得 **{value} 金幣**！"
         elif kind == "again":
-            db.execute("UPDATE players SET bonus_spins = bonus_spins + 1 WHERE guild_id=? AND user_id=?", (gid, uid))
-            result = "🔄 獲得**一次免費加轉**！再用 /spin"
+            db.execute(
+                "UPDATE players SET bonus_spins = bonus_spins + ? WHERE guild_id=? AND user_id=?", (value, gid, uid)
+            )
+            times = "一次" if value == 1 else f"{value} 次"
+            result = f"🔄 獲得**{times}免費加轉**！再用 /spin"
         else:  # style
             style_label = STYLES[value][0]
             if value in owned:

@@ -10,30 +10,35 @@ from stat_card import font as card_font
 
 # (key, label, weight %, kind, value)
 #   kind "coins": value = credits won
-#   kind "again": a free extra spin
+#   kind "again": value = number of free extra spins
 #   kind "style": value = card style key (if already owned you get STYLE_REFUND credits)
+# Expected return ≈ 22.3 coins per spin (a paid spin costs 25), counting 彩虹 as 250
 PRIZES = [
-    ("net",     "收網",   30.5, "coins", 0),
-    ("c10",     "10 金幣",  25, "coins", 10),
-    ("c100",    "100 金幣",  5, "coins", 100),
-    ("c25",     "25 金幣",  20, "coins", 25),
+    ("net",     "收網",   24.5, "coins", 0),
+    ("c10",     "10 金幣",  24, "coins", 10),
+    ("c100",    "100 金幣",  4, "coins", 100),
+    ("c15",     "15 金幣",  16, "coins", 15),
     ("rainbow", "彩虹卡面", 0.5, "style", "rainbow"),  # super jackpot
-    ("c50",     "50 金幣",  10, "coins", 50),
-    ("again",   "再轉一次",  8, "again", 0),
+    ("c25",     "25 金幣",  14, "coins", 25),
+    ("c50",     "50 金幣",   8, "coins", 50),
+    ("again",   "再轉一次",  6, "again", 1),
     ("jackpot", "250 金幣",  1, "coins", 250),
+    ("again2",  "再轉2次",   2, "again", 2),
 ]
-STYLE_REFUND = 150
+STYLE_REFUND = 250
 
 # how each prize looks on the wheel: (big text, small text, segment colour)
 LOOK = {
     "net":     ("收網", "",        (62, 66, 96)),
     "c10":     ("10",   "金幣",    (88, 101, 242)),
     "c100":    ("100",  "金幣",    (229, 72, 77)),
-    "c25":     ("25",   "金幣",    (48, 164, 108)),
+    "c15":     ("15",   "金幣",    (150, 90, 225)),
     "rainbow": ("彩虹", "限定卡面", None),            # drawn as a rainbow
+    "c25":     ("25",   "金幣",    (48, 164, 108)),
     "c50":     ("50",   "金幣",    (247, 107, 21)),
     "again":   ("再轉", "一次",    (18, 165, 148)),
     "jackpot": ("250",  "JACKPOT", (255, 178, 36)),
+    "again2":  ("再轉", "2次",     (220, 70, 140)),
 }
 GOLD = ((255, 226, 140), (214, 152, 40))
 
@@ -211,8 +216,8 @@ def parts():
 BULBS = 24
 CELEBRATE_MS = 50
 # extra animation frames after the wheel stops, per prize
-CELEBRATE_FRAMES = {"net": 14, "c10": 0, "c25": 0, "c50": 16, "c100": 18, "again": 16,
-                    "jackpot": 34, "rainbow": 34}
+CELEBRATE_FRAMES = {"net": 14, "c10": 0, "c15": 0, "c25": 0, "c50": 16, "c100": 18, "again": 16,
+                    "again2": 16, "jackpot": 34, "rainbow": 34}
 BIG_WINS = ("jackpot", "rainbow")
 
 
@@ -421,8 +426,8 @@ def banner(img, key, label, shine=None):
         text, fill = "超級 JACKPOT！彩虹卡面", None
     elif key == "jackpot":
         text, fill = "JACKPOT！250 金幣", None
-    elif key == "again":
-        text, fill = "再轉一次！", LOOK[key][2]
+    elif key in ("again", "again2"):
+        text, fill = f"{label}！", LOOK[key][2]
     else:
         text, fill = f"獲得 {label}！", LOOK[key][2]
 
@@ -501,7 +506,7 @@ def render_spin_gif(prize_index):
             highlight_top(img, 1.0 if (k // 2) % 2 == 0 else 0.35)
             sparkles(img, k, seed=prize_index)
             banner(img, key, label)
-        elif key == "again":
+        elif key in ("again", "again2"):
             img = frame(final, phase=0, all_on=True, disc=still)
             highlight_top(img)
             again_effect(img, k)
