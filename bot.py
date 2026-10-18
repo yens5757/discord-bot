@@ -1,4 +1,5 @@
 import asyncio
+import io
 import itertools
 import os
 import random
@@ -194,6 +195,7 @@ class Bot(discord.Client):
         self.owner_id = info.owner.id
         synced = await self.tree.sync()
         print(f"Synced {len(synced)} slash commands")
+        run_in_background(prepare_spin_gifs())
 
 
 client = Bot()
@@ -592,6 +594,42 @@ async def shop(interaction: discord.Interaction):
 
 spin_lock = asyncio.Lock()
 
+# One ready-made GIF per prize, so /spin can reply straight away.
+# When one is used, a fresh one (new landing spot) is drawn in the background.
+spin_gifs = {}                     # prize index -> GIF bytes
+spin_refilling = set()             # prize indexes being drawn right now
+spin_render_lock = asyncio.Lock()  # draw one GIF at a time: the server's CPU is small
+background_tasks = set()
+
+
+async def make_spin_gif(index):
+    async with spin_render_lock:
+        gif = await asyncio.to_thread(render_spin_gif, index)
+    return gif.getvalue()
+
+
+async def refill_spin_gif(index):
+    if index in spin_gifs or index in spin_refilling:
+        return
+    spin_refilling.add(index)
+    try:
+        spin_gifs[index] = await make_spin_gif(index)
+    except Exception as e:
+        print(f"Couldn't pre-draw spin GIF {index}: {e!r}")
+    finally:
+        spin_refilling.discard(index)
+
+
+async def prepare_spin_gifs():
+    for index in range(len(PRIZES)):
+        await refill_spin_gif(index)
+
+
+def run_in_background(coro):
+    task = asyncio.create_task(coro)
+    background_tasks.add(task)  # keep a reference so the task isn't garbage-collected
+    task.add_done_callback(background_tasks.discard)
+
 
 def hk_today():
     return datetime.now(HKT).date().isoformat()
@@ -657,11 +695,14 @@ async def spin(interaction: discord.Interaction):
         balance = get_wallet(gid, uid)[0]
 
     await interaction.response.defer()
-    gif = await asyncio.to_thread(render_spin_gif, index)
+    gif = spin_gifs.pop(index, None)
+    if gif is None:  # not ready yet, e.g. just after a restart
+        gif = await make_spin_gif(index)
+    run_in_background(refill_spin_gif(index))
     who = interaction.user.mention
     msg = await interaction.followup.send(
         content=f"🎡 {who} 轉動了轉盤（{paid_with}）……",
-        file=discord.File(gif, filename="spin.gif"),
+        file=discord.File(io.BytesIO(gif), filename="spin.gif"),
         wait=True,
     )
     await asyncio.sleep(2.6)  # let the wheel stop before revealing the result

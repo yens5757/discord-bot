@@ -233,13 +233,16 @@ def draw_bulbs(img, phase, all_on=False, chase=False):
             d.ellipse((x - 4, y - 4, x + 4, y + 4), fill=(150, 105, 40))
 
 
-def frame(angle, phase, all_on=False, chase=False, behind=None):
-    """One picture of the wheel. `behind` is drawn between the background and the wheel."""
+def frame(angle, phase, all_on=False, chase=False, behind=None, disc=None):
+    """One picture of the wheel. `behind` is drawn between the background and the wheel.
+    `disc` is an already-rotated disc, to skip rotating it again for a wheel that has stopped."""
     p = parts()
     img = p["bg"].copy()
     if behind is not None:
         img.alpha_composite(behind)
-    img.alpha_composite(p["disc"].rotate(angle, resample=Image.BICUBIC), (CX - R, CY - R))
+    if disc is None:
+        disc = p["disc"].rotate(angle, resample=Image.BICUBIC)
+    img.alpha_composite(disc, (CX - R, CY - R))
     img.alpha_composite(p["rim"], (CX - R - RIM, CY - R - RIM))
     draw_bulbs(img, phase, all_on, chase)
     img.alpha_composite(p["hub"], (CX - p["hub"].width // 2, CY - p["hub"].height // 2))
@@ -259,6 +262,25 @@ def highlight_top(img, strength=1.0):
     img.alpha_composite(layer)
 
 
+_RAY_GLOW = {}
+
+
+def ray_glow(rainbow):
+    """Soft glow behind the wheel; the same on every frame, so it's drawn once."""
+    if rainbow not in _RAY_GLOW:
+        glow = Image.new("RGBA", (CW, CH), (0, 0, 0, 0))
+        ImageDraw.Draw(glow).ellipse((CX - R - 60, CY - R - 60, CX + R + 60, CY + R + 60),
+                                     fill=(255, 230, 150, 120) if not rainbow else (255, 255, 255, 90))
+        _RAY_GLOW[rainbow] = glow.filter(ImageFilter.GaussianBlur(30))
+    return _RAY_GLOW[rainbow]
+
+
+def soft(layer, radius):
+    """Blur at half size, then scale back up: looks the same for soft glows and is ~4x cheaper."""
+    small = layer.resize((layer.width // 2, layer.height // 2), Image.BILINEAR)
+    return small.filter(ImageFilter.GaussianBlur(radius / 2)).resize(layer.size, Image.BILINEAR)
+
+
 def rays(t, rainbow):
     """Light rays spinning behind the wheel."""
     layer = Image.new("RGBA", (CW, CH), (0, 0, 0, 0))
@@ -271,11 +293,9 @@ def rays(t, rainbow):
         else:
             rgb = (255, 215, 110) if k % 2 == 0 else (255, 170, 50)
         d.pieslice((CX - reach, CY - reach, CX + reach, CY + reach), a0, a0 + 360 / n / 2, fill=(*rgb, 110))
-    glow = Image.new("RGBA", (CW, CH), (0, 0, 0, 0))
-    ImageDraw.Draw(glow).ellipse((CX - R - 60, CY - R - 60, CX + R + 60, CY + R + 60),
-                                 fill=(255, 230, 150, 120) if not rainbow else (255, 255, 255, 90))
-    layer.alpha_composite(glow.filter(ImageFilter.GaussianBlur(30)))
-    return layer.filter(ImageFilter.GaussianBlur(3))
+    layer = soft(layer, 3)
+    layer.alpha_composite(ray_glow(rainbow))
+    return layer
 
 
 def flash(img, alpha, colour=(255, 245, 210)):
@@ -378,7 +398,7 @@ def again_effect(img, k):
     d = ImageDraw.Draw(layer)
     rr = R + RIM + 8 + 6 * pulse
     d.ellipse((CX - rr, CY - rr, CX + rr, CY + rr), outline=(60, 220, 255, round(140 + 100 * pulse)), width=6)
-    img.alpha_composite(layer.filter(ImageFilter.GaussianBlur(3)))
+    img.alpha_composite(soft(layer, 3))
     # circular arrow spinning around the hub
     d = ImageDraw.Draw(img)
     ar = 62
@@ -464,11 +484,12 @@ def render_spin_gif(prize_index):
     count = CELEBRATE_FRAMES.get(key, 0)
     coins = make_particles(7, 46, "coin") if key == "jackpot" else []
     confetti = make_particles(11, 110, "confetti") if key == "rainbow" else []
+    still = parts()["disc"].rotate(final, resample=Image.BICUBIC)  # the wheel has stopped: rotate it once
 
     for k in range(max(count, 1)):
         t = k / max(1, count - 1)
         if key in BIG_WINS:
-            img = frame(final, phase=k, chase=True, behind=rays(t, rainbow=(key == "rainbow")))
+            img = frame(final, phase=k, chase=True, behind=rays(t, rainbow=(key == "rainbow")), disc=still)
             highlight_top(img, 0.6 + 0.4 * abs(math.sin(k * 0.5)))
             if key == "jackpot":
                 draw_coins(img, coins, k)
@@ -478,21 +499,21 @@ def render_spin_gif(prize_index):
             flash(img, 200 * max(0.0, 1 - k / 5))
             banner(img, key, label, shine=(k % 17) / 16)
         elif key in ("c50", "c100"):
-            img = frame(final, phase=0, all_on=(k // 2) % 2 == 0)
+            img = frame(final, phase=0, all_on=(k // 2) % 2 == 0, disc=still)
             highlight_top(img, 1.0 if (k // 2) % 2 == 0 else 0.35)
             sparkles(img, k, seed=prize_index)
             banner(img, key, label)
         elif key == "again":
-            img = frame(final, phase=0, all_on=True)
+            img = frame(final, phase=0, all_on=True, disc=still)
             highlight_top(img)
             again_effect(img, k)
             banner(img, key, label)
         elif key == "net":
-            img = frame(final, phase=0, all_on=False)
+            img = frame(final, phase=0, all_on=False, disc=still)
             spider_web(img, min(1.0, (k + 1) / 8))
             banner(img, key, label)
         else:  # small prizes: just light up the segment
-            img = frame(final, phase=0, all_on=True)
+            img = frame(final, phase=0, all_on=True, disc=still)
             highlight_top(img)
             banner(img, key, label)
         frames.append(img)
