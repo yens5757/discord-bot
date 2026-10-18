@@ -525,11 +525,16 @@ def cr7_foreground(img, panels):
     ImageDraw.Draw(img).text(s(W - 40, 475), "SIUUU!", font=font("bold", 15), fill=(255, 214, 100), anchor="rm")
 
 
+def champion_background(img, t):
+    import regions  # imports stat_card itself, so loaded here rather than at the top
+    if t["art"]:
+        header_art(img, t)
+    regions.background(img, t)
+
+
 def champion_foreground(img, t, panels):
-    edge_at = lambda k: grad_color([t["accent"][1], t["flex"], t["accent"][1]], k)  # noqa: E731
-    for box in panels:
-        gradient_outline(img, box, edge_at, 1.5, 18, repeats=1.2)
-    gradient_outline(img, (6, 6, W - 6, H - 6), edge_at, 4, 22, repeats=1.5)
+    import regions
+    regions.foreground(img, t, panels)  # region frame, decorations, region + roles line
 
     d = ImageDraw.Draw(img)
     f = font("bold", 16)
@@ -538,7 +543,7 @@ def champion_foreground(img, t, panels):
     box = (x, y - 14, x + tw + 26, y + 14)
     d.rounded_rectangle(s(*box), radius=14 * S, fill=t["accent"][1])
     d.text(s(x + 13 + tw / 2, y), t["champ_name"], font=f, fill=(20, 18, 24), anchor="mm")
-    d.text(s(W - 40, 482), t["champ_title"], font=font("bold", 14), fill=t["muted"], anchor="rm")
+    d.text(s(W - 40, 476), t["champ_title"], font=font("bold", 14), fill=t["muted"], anchor="rm")
 
 
 # ---------- Public functions ----------
@@ -553,8 +558,7 @@ def render_card_image(name, avatar_bytes, elo, credits, mix, flex, style="dark")
     for row in range(H * S):
         bg.line([(0, row), (W * S, row)], fill=lerp(*t["bg"], row / (H * S)))
     if fx == "champion":
-        if t["art"]:
-            header_art(img, t)
+        champion_background(img, t)
     elif fx == "cr7":
         cr7_background(img, t)
     else:

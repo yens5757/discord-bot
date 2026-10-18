@@ -105,6 +105,22 @@ def splash_image(cid):
     return ImageEnhance.Brightness(pic).enhance(0.9).convert("RGBA")
 
 
+def render_reel_preview(pool):
+    """Still picture of the reel for the /spin menu (PNG bytes): random icons, a ? in the middle."""
+    rnd = random.Random(7)
+    strip = [rnd.choice(pool) for _ in range(9)] if pool else ["?"] * 9
+    icons = {c: icon(c) for c in set(strip)}
+    img = reel_frame(background(), strip, icons, 4 * STEP)
+    d = ImageDraw.Draw(img)
+    d.rounded_rectangle((CW / 2 - ICON / 2, REEL_Y - ICON / 2, CW / 2 + ICON / 2, REEL_Y + ICON / 2), radius=14,
+                        fill=(24, 20, 38))
+    d.text((CW / 2, REEL_Y + 2), "?", font=font("bold", 64), fill=GOLD, anchor="mm")
+    d.text((CW / 2, CH - 52), "必定抽到未擁有的英雄卡", font=font("bold", 22), fill=(255, 236, 190), anchor="mm")
+    buf = BytesIO()
+    img.convert("RGB").save(buf, "PNG", optimize=True)
+    return buf.getvalue()
+
+
 def render_reel_gif(cid, pool):
     """Animated GIF that lands on champion `cid`. `pool` = champion ids to fill the reel with."""
     champions.download(cid)

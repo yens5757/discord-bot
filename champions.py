@@ -15,8 +15,10 @@ DATA_DIR = Path(__file__).with_name("champ_data")
 DDRAGON = "https://ddragon.leagueoflegends.com"
 PREFIX = "champ:"             # card style key for a champion, e.g. "champ:Darius"
 
-CHAMPIONS = {}                # champion id -> {"name": "達瑞斯", "title": "諾克薩斯之力"}
+CHAMPIONS = {}                # champion id -> {"name": "達瑞斯", "title": "諾克薩斯之力", "roles": [...]}
 VERSION = None                # Data Dragon patch the data came from
+# champion id -> region (from Riot's Universe site); champions missing here use "runeterra"
+REGION_OF = json.loads(Path(__file__).with_name("champ_regions.json").read_text("utf-8"))
 
 # hand-tuned framing where the default puts the face in the wrong place: id -> (x, y) of the face, 0-1
 FOCUS = {}
@@ -36,7 +38,7 @@ def load_list():
     try:
         VERSION = json.loads(fetch(f"{DDRAGON}/api/versions.json"))[0]
         data = json.loads(fetch(f"{DDRAGON}/cdn/{VERSION}/data/zh_TW/champion.json"))["data"]
-        champs = {cid: {"name": c["name"], "title": c["title"]} for cid, c in data.items()}
+        champs = {cid: {"name": c["name"], "title": c["title"], "roles": c["tags"]} for cid, c in data.items()}
         DATA_DIR.mkdir(exist_ok=True)
         saved.write_text(json.dumps({"version": VERSION, "champions": champs}, ensure_ascii=False), "utf-8")
     except Exception as e:
@@ -142,12 +144,13 @@ def theme(style):
     art = art_path(cid) if art_path(cid).exists() else None
     (h, s), (h2, s2) = main_colours(art) if art else ((0.11, 0.7), (0.0, 0.6))  # no art: gold and red
     accent, second = hsv(h, s, 0.92), hsv(h2, s2, 0.9)
-    info = CHAMPIONS.get(cid, {"name": cid, "title": ""})
+    info = CHAMPIONS.get(cid, {"name": cid, "title": "", "roles": []})
     return dict(
         bg=(hsv(h, s * 0.7, 0.07), hsv(h, s * 0.75, 0.16)), glows=(accent, second), glow_alpha=60,
         panel=hsv(h, 0.3, 0.13), edge=hsv(h, 0.4, 0.32), track=hsv(h, 0.32, 0.25), shadow=120,
         text=(246, 244, 242), muted=hsv(h, 0.16, 0.74),
         accent=(hsv(h, s * 0.45, 1.0), accent), mix=accent, flex=second,
         fx="champion", art=art, focus=FOCUS.get(cid, DEFAULT_FOCUS),
-        champ_name=info["name"], champ_title=info["title"],
+        champ_name=info["name"], champ_title=info["title"], champ_id=cid,
+        region=REGION_OF.get(cid, "runeterra"), roles=info.get("roles", []),
     )
