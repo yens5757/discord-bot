@@ -45,6 +45,7 @@
 | 暗紅 | 300 金幣 | 火花粒子、紅色外框 |
 | 霓虹 | 500 金幣 | 霓虹發光外框、網格背景、掃描線、「霓虹」徽章 |
 | 黃金 | 800 金幣 | 頭像皇冠、金箔名字及外框、裝飾藝術花紋、閃光、「黃金」徽章 |
+| CR7 | 500 金幣 | C 朗相片、葡萄牙紅綠背景、足球六角紋、金色外框、五粒星、SIUUU!、「CR7」徽章 |
 | 彩虹 | 轉盤限定 | 全息彩虹背景、彩虹名字及外框、閃光、「限定」徽章 |
 
 ![卡面商店](shop_preview.png)
@@ -94,5 +95,7 @@
 戰績卡需要中文字型：Windows 會用微軟正黑體，macOS 用蘋方，Linux 需要安裝 Noto Sans CJK。
 
 ---
+
+CR7 卡面相片：[Argentine - Portugal - Cristiano Ronaldo.jpg](https://commons.wikimedia.org/wiki/File:Argentine_-_Portugal_-_Cristiano_Ronaldo.jpg)，攝影：Ludovic Péron，授權：[CC BY-SA 3.0](https://creativecommons.org/licenses/by-sa/3.0/)（已裁剪及調色）。
 
 收網機械人 isn't endorsed by Riot Games and doesn't reflect the views or opinions of Riot Games or anyone officially involved in producing or managing Riot Games properties. Riot Games, and all associated properties are trademarks or registered trademarks of Riot Games, Inc.

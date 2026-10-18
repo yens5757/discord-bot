@@ -54,6 +54,15 @@ STYLES = {
         text=(252, 242, 218), muted=(192, 172, 132),
         accent=((255, 222, 130), (205, 150, 45)), mix=(242, 202, 92), flex=(222, 160, 62), fx="gold",
     )),
+    "cr7": ("CR7", 500, dict(
+        bg=((6, 40, 26), (52, 8, 16)), glows=((0, 150, 80), (215, 25, 45)), glow_alpha=70,
+        panel=(16, 24, 22), edge=(120, 98, 50), track=(44, 52, 46), shadow=120,
+        text=(255, 246, 225), muted=(196, 186, 160),
+        accent=((255, 226, 140), (214, 160, 50)), mix=(230, 40, 60), flex=(40, 190, 110), fx="cr7",
+        # photo: "Argentine - Portugal - Cristiano Ronaldo.jpg" by Ludovic Péron, CC BY-SA 3.0, Wikimedia Commons
+        art=Path(__file__).with_name("art") / "cr7.jpg", focus=(0.535, 0.30),
+        art_zoom=0.66, art_brightness=0.78, art_tint=(130, 12, 30), art_at=(0.47, 0.27),
+    )),
     "rainbow": ("彩虹", None, dict(
         bg=((14, 12, 26), (24, 20, 40)), glows=((255, 90, 170), (70, 190, 255)), glow_alpha=70,
         panel=(28, 25, 46), edge=(72, 62, 112), track=(48, 44, 78), shadow=110,
@@ -226,7 +235,8 @@ def mode_panel(img, x, y, w, h, title, color, games, wins, t):
 
 GOLD_FOIL = [(255, 242, 190), (198, 142, 42), (255, 228, 145), (146, 96, 22), (255, 238, 175)]
 NEON_CYAN, NEON_PINK = (0, 235, 255), (255, 60, 220)
-BADGES = {"gold": "黃金", "rainbow": "限定", "neon": "霓虹"}
+BADGES = {"gold": "黃金", "rainbow": "限定", "neon": "霓虹", "cr7": "CR7"}
+PT_GREEN, PT_RED = (0, 110, 50), (205, 20, 45)
 
 
 def hue(t, sat=0.75, val=1.0):
@@ -384,7 +394,8 @@ def badge(img, x, y, fx):
     d = ImageDraw.Draw(img)
     tw = d.textlength(text, font=f) / S
     box = (x, y - 14, x + tw + 26, y + 14)
-    fill_at = {"gold": gold_at, "rainbow": rainbow_at, "neon": lambda t: lerp(NEON_CYAN, NEON_PINK, t)}[fx]
+    fill_at = {"gold": gold_at, "cr7": gold_at, "rainbow": rainbow_at,
+               "neon": lambda t: lerp(NEON_CYAN, NEON_PINK, t)}[fx]
     mask = Image.new("L", img.size, 0)
     ImageDraw.Draw(mask).rounded_rectangle(s(*box), radius=14 * S, fill=255)
     grad = Image.new("RGB", img.size)
@@ -392,9 +403,10 @@ def badge(img, x, y, fx):
     for xx in range(round(box[0] * S), round(box[2] * S) + 1):
         gd.line([(xx, 0), (xx, img.size[1])], fill=fill_at((xx / S - box[0]) / (box[2] - box[0])))
     img.paste(grad, (0, 0), mask)
-    text_col = (60, 38, 6) if fx == "gold" else (255, 255, 255)
+    on_gold = fx in ("gold", "cr7")
+    text_col = (60, 38, 6) if on_gold else (255, 255, 255)
     d.text(s(x + 13 + tw / 2, y), text, font=f, fill=text_col, anchor="mm",
-           stroke_width=0 if fx == "gold" else S, stroke_fill=(30, 20, 40))
+           stroke_width=0 if on_gold else S, stroke_fill=(30, 20, 40))
 
 
 def foreground_fx(img, fx, panels):
@@ -428,18 +440,24 @@ def foreground_fx(img, fx, panels):
 ART_BOX = (330, 0, W, 330)  # right side of the header; the panels cover the bottom part
 
 
-def header_art(img, t, zoom=0.74, brightness=0.82):
-    """Champion splash in the right of the header, fading out towards the name and the panels."""
+def header_art(img, t):
+    """Picture in the right of the header, fading out towards the name and the panels.
+    t["focus"] = where the face is in the picture (0-1); optional art_zoom / art_brightness /
+    art_tint / art_at (where the face goes in the header) fine-tune the framing."""
     x0, y0, x1, y1 = ART_BOX
     bw, bh = (x1 - x0) * S, (y1 - y0) * S
     src = Image.open(t["art"]).convert("RGB")
     fx_, fy = t["focus"]
-    cw = src.width * zoom
+    ax, ay = t.get("art_at", (0.5, 0.3))
+    cw = src.width * t.get("art_zoom", 0.74)
     ch = cw * bh / bw
-    left = min(max(fx_ * src.width - cw * 0.5, 0), src.width - cw)
-    top = min(max(fy * src.height - ch * 0.3, 0), src.height - ch)
+    left = min(max(fx_ * src.width - cw * ax, 0), src.width - cw)
+    top = min(max(fy * src.height - ch * ay, 0), src.height - ch)
     pic = src.resize((bw, bh), Image.LANCZOS, box=(left, top, left + cw, top + ch))
-    pic = ImageEnhance.Brightness(pic).enhance(brightness).convert("RGBA")
+    pic = ImageEnhance.Brightness(pic).enhance(t.get("art_brightness", 0.82))
+    if t.get("art_tint"):
+        pic = Image.blend(pic, Image.new("RGB", pic.size, t["art_tint"]), 0.18)
+    pic = pic.convert("RGBA")
 
     fade = Image.new("L", (bw, bh), 0)
     fd = ImageDraw.Draw(fade)
@@ -455,6 +473,56 @@ def header_art(img, t, zoom=0.74, brightness=0.82):
     shade = Image.new("RGBA", img.size, (0, 0, 0, 0))  # keeps the ELO number readable
     ImageDraw.Draw(shade).ellipse(s(W - 300, 10, W + 20, 200), fill=(0, 0, 0, 165))
     img.alpha_composite(shade.filter(ImageFilter.GaussianBlur(28 * S)))
+
+
+def star5(d, x, y, r, colour):
+    pts = []
+    for i in range(10):
+        rr = r if i % 2 == 0 else r * 0.42
+        a = math.radians(i * 36)
+        pts.append(s(x + rr * math.sin(a), y - rr * math.cos(a)))
+    d.polygon(pts, fill=colour)
+
+
+def cr7_background(img, t):
+    flag = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    fd = ImageDraw.Draw(flag)
+    fd.polygon([s(0, 0), s(330, 0), s(250, H), s(0, H)], fill=(*PT_GREEN, 120))  # Portugal: green | red
+    fd.polygon([s(330, 0), s(W, 0), s(W, H), s(250, H)], fill=(*PT_RED, 95))
+    img.alpha_composite(flag.filter(ImageFilter.GaussianBlur(10 * S)))
+
+    hexes = Image.new("RGBA", img.size, (0, 0, 0, 0))  # football pattern
+    hd = ImageDraw.Draw(hexes)
+    size = 26
+    hw, hh = size * math.sqrt(3), size * 1.5
+    for row in range(-1, int(H / hh) + 2):
+        for col in range(-1, int(W / hw) + 2):
+            cx, cy = col * hw + (hw / 2 if row % 2 else 0), row * hh
+            hd.polygon([s(cx + size * math.cos(math.radians(60 * k + 30)), cy + size * math.sin(math.radians(60 * k + 30)))
+                        for k in range(6)], outline=(255, 255, 255, 16), width=S)
+    img.alpha_composite(hexes)
+    header_art(img, t)
+
+
+def cr7_foreground(img, panels):
+    for box in panels:
+        gradient_outline(img, box, gold_at, 2, 18, repeats=1.5)
+    sparkles = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    sp = ImageDraw.Draw(sparkles)
+    for x, y, r in ((470, 40, 5), (520, 168, 4), (660, 30, 3), (430, 180, 3), (690, 176, 6), (560, 22, 3)):
+        sparkle(sp, x, y, r, (255, 240, 190, 230))  # header only, clear of the name and ELO
+    img.alpha_composite(sparkles.filter(ImageFilter.GaussianBlur(2 * S)))
+    img.alpha_composite(sparkles)
+    gradient_outline(img, (6, 6, W - 6, H - 6), gold_at, 5, 22, repeats=2)
+    gradient_outline(img, (14, 14, W - 14, H - 14), lambda t: lerp(PT_GREEN, PT_RED, t), 1.5, 17)
+
+    stars = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    sd = ImageDraw.Draw(stars)
+    for i in range(5):
+        star5(sd, W / 2 - 48 + i * 24, 475, 7, (255, 214, 100, 255))
+    img.alpha_composite(stars.filter(ImageFilter.GaussianBlur(3 * S)))
+    img.alpha_composite(stars)
+    ImageDraw.Draw(img).text(s(W - 40, 475), "SIUUU!", font=font("bold", 15), fill=(255, 214, 100), anchor="rm")
 
 
 def champion_foreground(img, t, panels):
@@ -487,6 +555,8 @@ def render_card_image(name, avatar_bytes, elo, credits, mix, flex, style="dark")
     if fx == "champion":
         if t["art"]:
             header_art(img, t)
+    elif fx == "cr7":
+        cr7_background(img, t)
     else:
         background_fx(img, fx)
     glow(img, (W - 80, 40), 180, t["glows"][0], t["glow_alpha"])
@@ -542,6 +612,8 @@ def render_card_image(name, avatar_bytes, elo, credits, mix, flex, style="dark")
     mode_panel(img, 40 + pw + 24, 205, pw, 260, "Flex", t["flex"], *flex, t)
     if fx == "champion":
         champion_foreground(img, t, panels)
+    elif fx == "cr7":
+        cr7_foreground(img, panels)
     else:
         foreground_fx(img, fx, panels)
     return img
