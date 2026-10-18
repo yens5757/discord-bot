@@ -474,19 +474,17 @@ def render_spin_gif(prize_index):
     key, label = PRIZES[prize_index][0], PRIZES[prize_index][1]
     ease_power = 4 if near_miss else 3   # near misses crawl more slowly at the end
 
-    frames, durations = [], []
-    for f in range(FRAMES):
-        t = f / (FRAMES - 1)
-        angle = final * (1 - (1 - t) ** ease_power)
-        frames.append(frame(angle, phase=f // 3))
-        durations.append(FRAME_MS)
-
     count = CELEBRATE_FRAMES.get(key, 0)
     coins = make_particles(7, 46, "coin") if key == "jackpot" else []
     confetti = make_particles(11, 110, "confetti") if key == "rainbow" else []
     still = parts()["disc"].rotate(final, resample=Image.BICUBIC)  # the wheel has stopped: rotate it once
+    total = FRAMES + max(count, 1)
 
-    for k in range(max(count, 1)):
+    def draw(f):
+        if f < FRAMES:  # spinning
+            t = f / (FRAMES - 1)
+            return frame(final * (1 - (1 - t) ** ease_power), phase=f // 3)
+        k = f - FRAMES  # stopped: celebration
         t = k / max(1, count - 1)
         if key in BIG_WINS:
             img = frame(final, phase=k, chase=True, behind=rays(t, rainbow=(key == "rainbow")), disc=still)
@@ -516,17 +514,24 @@ def render_spin_gif(prize_index):
             img = frame(final, phase=0, all_on=True, disc=still)
             highlight_top(img)
             banner(img, key, label)
-        frames.append(img)
-        durations.append(CELEBRATE_MS)
-    durations[-1] = HOLD_MS  # stay on the final picture
+        return img
 
     # shared palette built from a few sample frames keeps colours steady
-    samples = [frames[0], frames[FRAMES // 2], frames[FRAMES], frames[-1]]
-    sheet = Image.new("RGB", (CW * len(samples), CH))
-    for i, fr in enumerate(samples):
-        sheet.paste(fr.convert("RGB"), (CW * i, 0))
+    sample_ids = [0, FRAMES // 2, FRAMES, total - 1]
+    samples = {f: draw(f) for f in set(sample_ids)}
+    sheet = Image.new("RGB", (CW * len(sample_ids), CH))
+    for i, f in enumerate(sample_ids):
+        sheet.paste(samples[f].convert("RGB"), (CW * i, 0))
     palette_src = sheet.quantize(colors=255, method=Image.MEDIANCUT)
-    pal = [fr.convert("RGB").quantize(palette=palette_src, dither=Image.NONE) for fr in frames]
+
+    # turn each frame into the small palette version straight away, so full-colour frames
+    # don't pile up in memory (matters on a 1 GB server)
+    pal = []
+    for f in range(total):
+        img = samples.pop(f, None) or draw(f)
+        pal.append(img.convert("RGB").quantize(palette=palette_src, dither=Image.NONE))
+    durations = [FRAME_MS] * FRAMES + [CELEBRATE_MS] * (total - FRAMES)
+    durations[-1] = HOLD_MS  # stay on the final picture
 
     buf = BytesIO()
     pal[0].save(buf, "GIF", save_all=True, append_images=pal[1:], duration=durations,
