@@ -24,8 +24,8 @@ MIX_SIZE = 10            # 10mix: 10 players split into 2 teams (set to 2 to tes
 START_ELO = 1000         # everyone's starting ELO
 ELO_CHANGE = 20          # Flex: win +20, loss -20 (both modes share the same ELO)
 START_CREDITS = 100      # credits every player starts with
-CREDIT_WIN = 10          # credits for a win (10mix and Flex)
-CREDIT_LOSS = 3          # credits for a loss
+CREDIT_WIN = 20          # credits for a win (10mix and Flex)
+CREDIT_LOSS = 5          # credits for a loss
 SPIN_COST = 25           # credits per paid spin (one free spin a day)
 HKT = timezone(timedelta(hours=8))  # free spin resets at 00:00 Hong Kong time
 MIX_K = 40               # 10mix: even teams = ±20; the stronger team gains less / loses more
