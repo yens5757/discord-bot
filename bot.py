@@ -427,6 +427,24 @@ async def setelo(interaction: discord.Interaction, user: discord.Member, value: 
     )
 
 
+@client.tree.command(name="givecoins", description="送金幣給玩家（只限 bot 擁有者）")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)  # hides it from non-admins in the menu
+@app_commands.describe(user="要送金幣的玩家", amount="金幣數量")
+async def givecoins(interaction: discord.Interaction, user: discord.Member, amount: app_commands.Range[int, 1, 100000]):
+    if interaction.user.id != client.owner_id:
+        await interaction.response.send_message("只有 bot 擁有者可以使用這個指令。", ephemeral=True)
+        return
+    get_player(interaction.guild_id, user.id)
+    db.execute(
+        "UPDATE players SET credits = credits + ? WHERE guild_id=? AND user_id=?",
+        (amount, interaction.guild_id, user.id),
+    )
+    db.commit()
+    credits = get_wallet(interaction.guild_id, user.id)[0]
+    await interaction.response.send_message(f"🎁 {user.mention} 獲得 **{amount} 金幣**！現有金幣：{credits}")
+
+
 # ---------- Stats commands ----------
 
 def mode_stats(guild_id, user_id):
