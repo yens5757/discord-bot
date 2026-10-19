@@ -454,6 +454,58 @@ async def givecoins(interaction: discord.Interaction, user: discord.Member, amou
     await interaction.response.send_message(f"🎁 {user.mention} 獲得 **{amount} 金幣**！現有金幣：{credits}")
 
 
+def all_cards():
+    """Every card there is: the basic styles, then every champion."""
+    return list(STYLES) + [champions.style_key(c) for c in champions.CHAMPIONS]
+
+
+def card_subtitle(key):
+    if champions.is_champion(key):
+        return champions.CHAMPIONS.get(champions.champion_id(key), {}).get("title", "")
+    return "基本款式"
+
+
+@client.tree.command(name="givecard", description="送卡面給玩家（只限 bot 擁有者）")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)  # hides it from non-admins in the menu
+@app_commands.describe(user="要送卡面的玩家", card="卡面（打字搜尋，例如 達瑞斯 / Darius / 黃金）")
+async def givecard(interaction: discord.Interaction, user: discord.Member, card: str):
+    if interaction.user.id != client.owner_id:
+        await interaction.response.send_message("只有 bot 擁有者可以使用這個指令。", ephemeral=True)
+        return
+    if card not in all_cards():  # typed something without picking from the list
+        await interaction.response.send_message(f"找不到「{card}」，請喺選單揀一個卡面。", ephemeral=True)
+        return
+    gid = interaction.guild_id
+    if card in get_wallet(gid, user.id)[2]:
+        await interaction.response.send_message(f"{user.display_name} 已經擁有「{card_label(card)}」。", ephemeral=True)
+        return
+    db.execute("INSERT INTO owned_styles (guild_id, user_id, style) VALUES (?, ?, ?)", (gid, user.id, card))
+    db.commit()
+    await interaction.response.defer()  # the card preview may need drawing first
+    extra = ""
+    if champions.is_champion(card):
+        collected = sum(champions.is_champion(k) for k in get_wallet(gid, user.id)[2])
+        extra = f"（英雄卡已收集 {collected}/{len(champions.CHAMPIONS)}）"
+    await interaction.followup.send(
+        content=f"🎁 {user.mention} 獲得卡面「**{card_label(card)}**」！{extra}\n用 /shop →「更換卡面」套用",
+        file=discord.File(io.BytesIO(await card_preview(card)), filename="card.png"),
+    )
+
+
+@givecard.autocomplete("card")
+async def givecard_search(interaction: discord.Interaction, current: str):
+    query = current.strip().lower()
+    choices = []
+    for key in all_cards():
+        name, sub = card_label(key), card_subtitle(key)
+        if query in f"{name} {key} {sub}".lower():
+            choices.append(app_commands.Choice(name=f"{name}・{sub}" if sub else name, value=key))
+            if len(choices) == 25:  # Discord shows at most 25
+                break
+    return choices
+
+
 # ---------- Stats commands ----------
 
 def mode_stats(guild_id, user_id):
