@@ -63,6 +63,15 @@ STYLES = {
         art=Path(__file__).with_name("art") / "cr7.jpg", focus=(0.535, 0.30),
         art_zoom=0.66, art_brightness=0.78, art_tint=(130, 12, 30), art_at=(0.47, 0.27),
     )),
+    "lbj": ("LBJ", 500, dict(
+        bg=((18, 8, 32), (40, 16, 62)), glows=((253, 185, 39), (120, 60, 200)), glow_alpha=60,
+        panel=(28, 16, 44), edge=(110, 84, 46), track=(56, 40, 82), shadow=120,
+        text=(255, 248, 230), muted=(200, 182, 222),
+        accent=((255, 224, 130), (240, 170, 40)), mix=(253, 185, 39), flex=(170, 110, 255), fx="lbj",
+        # photo: "LeBron James dribbling (March 21, 2022).jpg" by Erik Drost, CC BY 2.0, Wikimedia Commons
+        art=Path(__file__).with_name("art") / "lbj.jpg", focus=(0.49, 0.13),
+        art_zoom=0.6, art_brightness=0.8, art_tint=(85, 37, 131), art_at=(0.46, 0.22),
+    )),
     "rainbow": ("彩虹", None, dict(
         bg=((14, 12, 26), (24, 20, 40)), glows=((255, 90, 170), (70, 190, 255)), glow_alpha=70,
         panel=(28, 25, 46), edge=(72, 62, 112), track=(48, 44, 78), shadow=110,
@@ -235,7 +244,8 @@ def mode_panel(img, x, y, w, h, title, color, games, wins, t):
 
 GOLD_FOIL = [(255, 242, 190), (198, 142, 42), (255, 228, 145), (146, 96, 22), (255, 238, 175)]
 NEON_CYAN, NEON_PINK = (0, 235, 255), (255, 60, 220)
-BADGES = {"gold": "黃金", "rainbow": "限定", "neon": "霓虹", "cr7": "CR7"}
+BADGES = {"gold": "黃金", "rainbow": "限定", "neon": "霓虹", "cr7": "CR7", "lbj": "LBJ"}
+LAKERS_PURPLE, LAKERS_GOLD = (85, 37, 131), (253, 185, 39)
 PT_GREEN, PT_RED = (0, 110, 50), (205, 20, 45)
 
 
@@ -394,7 +404,7 @@ def badge(img, x, y, fx):
     d = ImageDraw.Draw(img)
     tw = d.textlength(text, font=f) / S
     box = (x, y - 14, x + tw + 26, y + 14)
-    fill_at = {"gold": gold_at, "cr7": gold_at, "rainbow": rainbow_at,
+    fill_at = {"gold": gold_at, "cr7": gold_at, "lbj": gold_at, "rainbow": rainbow_at,
                "neon": lambda t: lerp(NEON_CYAN, NEON_PINK, t)}[fx]
     mask = Image.new("L", img.size, 0)
     ImageDraw.Draw(mask).rounded_rectangle(s(*box), radius=14 * S, fill=255)
@@ -403,7 +413,7 @@ def badge(img, x, y, fx):
     for xx in range(round(box[0] * S), round(box[2] * S) + 1):
         gd.line([(xx, 0), (xx, img.size[1])], fill=fill_at((xx / S - box[0]) / (box[2] - box[0])))
     img.paste(grad, (0, 0), mask)
-    on_gold = fx in ("gold", "cr7")
+    on_gold = fx in ("gold", "cr7", "lbj")
     text_col = (60, 38, 6) if on_gold else (255, 255, 255)
     d.text(s(x + 13 + tw / 2, y), text, font=f, fill=text_col, anchor="mm",
            stroke_width=0 if on_gold else S, stroke_fill=(30, 20, 40))
@@ -504,6 +514,45 @@ def cr7_background(img, t):
     header_art(img, t)
 
 
+def lbj_background(img, t):
+    planks = Image.new("RGBA", img.size, (0, 0, 0, 0))  # hardwood floor
+    pd = ImageDraw.Draw(planks)
+    rnd = random.Random(23)
+    for x in range(0, W, 30):
+        pd.rectangle(s(x, 0, x + 29, H), fill=(200, 140, 70, rnd.randint(8, 22)))
+        pd.line(s(x, 0, x, H), fill=(0, 0, 0, 40), width=S)
+    img.alpha_composite(planks)
+    court = Image.new("RGBA", img.size, (0, 0, 0, 0))  # centre circle and half-court line
+    cd = ImageDraw.Draw(court)
+    for r in (90, 30):
+        cd.ellipse(s(330 - r, 110 - r, 330 + r, 110 + r), outline=(*LAKERS_GOLD, 50), width=2 * S)
+    cd.line(s(330, 0, 330, H), fill=(*LAKERS_GOLD, 50), width=2 * S)
+    img.alpha_composite(court)
+    header_art(img, t)
+
+
+def basketball(d, x, y, r):
+    d.ellipse(s(x - r, y - r, x + r, y + r), fill=(235, 120, 40, 255), outline=(60, 25, 10, 255), width=S)
+    d.line(s(x - r, y, x + r, y), fill=(60, 25, 10, 255), width=S)
+    d.line(s(x, y - r, x, y + r), fill=(60, 25, 10, 255), width=S)
+    d.arc(s(x - r * 1.6, y - r, x - r * 0.4, y + r), -60, 60, fill=(60, 25, 10, 255), width=S)
+    d.arc(s(x + r * 0.4, y - r, x + r * 1.6, y + r), 120, 240, fill=(60, 25, 10, 255), width=S)
+
+
+def lbj_foreground(img, panels):
+    for box in panels:
+        gradient_outline(img, box, lambda t: lerp(LAKERS_GOLD, (255, 230, 150), abs(t * 2 - 1)), 2, 18, repeats=1.5)
+    gradient_outline(img, (6, 6, W - 6, H - 6), lambda t: grad_color([LAKERS_GOLD, (140, 80, 210), LAKERS_GOLD], t),
+                     5, 22, repeats=1.5)
+    gradient_outline(img, (14, 14, W - 14, H - 14), lambda t: lerp(LAKERS_PURPLE, (170, 110, 255), t), 1.5, 17)
+    balls = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    bd = ImageDraw.Draw(balls)
+    for i in range(4):  # 4 championships
+        basketball(bd, W / 2 - 36 + i * 24, 475, 7.5)
+    img.alpha_composite(balls)
+    ImageDraw.Draw(img).text(s(W - 40, 475), "THE KING", font=font("bold", 15), fill=LAKERS_GOLD, anchor="rm")
+
+
 def cr7_foreground(img, panels):
     for box in panels:
         gradient_outline(img, box, gold_at, 2, 18, repeats=1.5)
@@ -561,6 +610,8 @@ def render_card_image(name, avatar_bytes, elo, credits, mix, flex, style="dark")
         champion_background(img, t)
     elif fx == "cr7":
         cr7_background(img, t)
+    elif fx == "lbj":
+        lbj_background(img, t)
     else:
         background_fx(img, fx)
     glow(img, (W - 80, 40), 180, t["glows"][0], t["glow_alpha"])
@@ -568,7 +619,7 @@ def render_card_image(name, avatar_bytes, elo, credits, mix, flex, style="dark")
 
     # header: avatar (+ crown for gold)
     img.alpha_composite(avatar_with_ring(avatar_bytes, 136, t), s(40, 32))
-    if fx == "gold":
+    if fx in ("gold", "lbj"):  # 黃金, and The King
         crown(img, 108, 17)
     draw = ImageDraw.Draw(img)
 
@@ -618,6 +669,8 @@ def render_card_image(name, avatar_bytes, elo, credits, mix, flex, style="dark")
         champion_foreground(img, t, panels)
     elif fx == "cr7":
         cr7_foreground(img, panels)
+    elif fx == "lbj":
+        lbj_foreground(img, panels)
     else:
         foreground_fx(img, fx, panels)
     return img
