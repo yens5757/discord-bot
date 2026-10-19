@@ -418,7 +418,6 @@ async def cancel(interaction: discord.Interaction, match_id: int):
 
 @client.tree.command(name="setelo", description="設定玩家的 ELO（只限 bot 擁有者）")
 @app_commands.guild_only()
-@app_commands.default_permissions(administrator=True)  # hides it from non-admins in the menu
 @app_commands.describe(user="要修改的玩家", value="新的 ELO")
 async def setelo(interaction: discord.Interaction, user: discord.Member, value: app_commands.Range[int, 0, 10000]):
     if interaction.user.id != client.owner_id:
@@ -438,7 +437,6 @@ async def setelo(interaction: discord.Interaction, user: discord.Member, value: 
 
 @client.tree.command(name="givecoins", description="送金幣給玩家（只限 bot 擁有者）")
 @app_commands.guild_only()
-@app_commands.default_permissions(administrator=True)  # hides it from non-admins in the menu
 @app_commands.describe(user="要送金幣的玩家", amount="金幣數量")
 async def givecoins(interaction: discord.Interaction, user: discord.Member, amount: app_commands.Range[int, 1, 100000]):
     if interaction.user.id != client.owner_id:
@@ -467,7 +465,6 @@ def card_subtitle(key):
 
 @client.tree.command(name="givecard", description="送卡面給玩家（只限 bot 擁有者）")
 @app_commands.guild_only()
-@app_commands.default_permissions(administrator=True)  # hides it from non-admins in the menu
 @app_commands.describe(user="要送卡面的玩家", card="卡面（打字搜尋，例如 達瑞斯 / Darius / 黃金）")
 async def givecard(interaction: discord.Interaction, user: discord.Member, card: str):
     if interaction.user.id != client.owner_id:
