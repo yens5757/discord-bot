@@ -625,8 +625,8 @@ def team_members(gid, game):
 
 
 async def record_flex_game(match_id, data):
-    """A finished ranked Flex game: for every server with 3+ linked members on one team, record it,
-    or, if that team also had players nobody has linked, hold it until the owner decides (/flexreview)."""
+    """A finished ranked Flex game: for every server with 3+ linked members on one team, record it for
+    them; teammates nobody has linked are kept for the owner to link or skip (/flexreview)."""
     info = data["info"]
     started = info["gameStartTimestamp"] // 1000
     if info.get("gameDuration", 0) < 300:  # remake
@@ -643,19 +643,19 @@ async def record_flex_game(match_id, data):
         team = [{k: p.get(k) for k in TEAM_KEYS} for p in info["participants"] if p["teamId"] == team_id]
         game = {"won": team[0]["win"], "duration": info["gameDuration"], "start": started,
                 "server": info.get("platformId", riot.DEFAULT_SERVER).lower(), "team": team}
+        number = await finish_flex_game(gid, match_id, game)  # linked members count straight away
         linked = linked_puuids(gid)
-        if any(p["puuid"] not in linked for p in team):
+        if any(p["puuid"] not in linked for p in team):  # unlinked teammates wait for the owner
+            game["number"] = number
             held = db.execute("INSERT OR IGNORE INTO flex_reviews VALUES (?, ?, ?, ?, '{}', ?)",
                               (match_id, gid, team_id, json.dumps(game, ensure_ascii=False), int(time.time()))).rowcount
             db.commit()
             if held:  # tell the owner once per game
                 await tell_owner_about_review(gid, match_id, game)
-        else:
-            await finish_flex_game(gid, match_id, game)
 
 
 async def finish_flex_game(gid, match_id, game):
-    """Record the game for the team's linked members and announce it."""
+    """Record the game for the team's linked members and announce it. Returns its match number."""
     members = team_members(gid, game)
     ids = [uid for uid, _ in members]
     won = game["won"]
@@ -666,6 +666,7 @@ async def finish_flex_game(gid, match_id, game):
     )
     db.commit()
     await announce_flex(gid, cur.lastrowid, match_id, {"gameDuration": game["duration"]}, members, won)
+    return cur.lastrowid
 
 
 def review_embed(gid, match_id, game, decisions):
@@ -682,10 +683,10 @@ def review_embed(gid, match_id, game, decisions):
             lines.append(f"❓ **{riot_name(p)}** {stats}")
     started = datetime.fromtimestamp(game["start"], HKT).strftime("%m/%d %H:%M")
     return discord.Embed(
-        title=f"📋 Flex 待確認：{'贏了' if game['won'] else '輸了'}（{started}，{game['duration'] // 60} 分鐘）",
-        description="\n".join(lines) + "\n\n❓ = 未連結的隊友：連結到成員，或者略過",
+        title=f"📋 Flex 第 {game.get('number', '?')} 場：{'贏了' if game['won'] else '輸了'}（{started}，{game['duration'] // 60} 分鐘）",
+        description="\n".join(lines) + "\n\n✅ 已連結成員已經計分　❓ 未連結的隊友：連結到成員（會補計呢場）或者略過",
         color=discord.Color.blurple(),
-    ).set_footer(text=f"決定之前唔會更新 ELO｜{match_id}")
+    ).set_footer(text=match_id)
 
 
 async def tell_owner_about_review(gid, match_id, game):
@@ -693,7 +694,8 @@ async def tell_owner_about_review(gid, match_id, game):
     try:
         owner = client.get_user(client.owner_id) or await client.fetch_user(client.owner_id)
         embed = review_embed(gid, match_id, game, {})
-        await owner.send(content="有一場 Flex 有未連結的隊友，喺伺服器用 **/flexreview** 決定連結定略過。", embed=embed)
+        await owner.send(content="有一場 Flex 有未連結的隊友（已連結成員已經計分），喺伺服器用 **/flexreview** 決定連結定略過。",
+                         embed=embed)
     except discord.HTTPException as e:
         print(f"Couldn't DM the owner about {match_id}: {e!r}")
 
@@ -733,9 +735,10 @@ async def check_flex_games(session):
         data = await riot.match(session, srv, match_id)
         if not data or not data["info"].get("gameEndTimestamp"):
             continue  # not finished yet: look again next time
-        await record_flex_game(match_id, data)
+        # mark it checked first: if recording fails halfway, the game is skipped rather than counted twice
         db.execute("INSERT OR IGNORE INTO riot_matches VALUES (?, ?)", (match_id, int(time.time())))
         db.commit()
+        await record_flex_game(match_id, data)
 
 
 async def watch_flex():
@@ -1456,8 +1459,8 @@ async def spin(interaction: discord.Interaction):
 # ---------- Flex review (games with unlinked teammates) ----------
 
 class FlexReviewView(MenuView):
-    """/flexreview: Flex games held back because a teammate isn't linked. For each one, link them to a
-    member or skip them; once everyone is decided the game is recorded (with the new links) and announced."""
+    """/flexreview: recorded Flex games that had teammates nobody has linked. Link each one to a member
+    (they get that game's result too) or skip them; once everyone is decided the game leaves the list."""
 
     def __init__(self, interaction):
         super().__init__(interaction)
@@ -1486,7 +1489,7 @@ class FlexReviewView(MenuView):
                 select.callback = self.link_to(p, select)
                 self.add_item(select)
                 self.button(f"略過 {riot_name(p)}"[:80], self.skip(p), row=3)
-            self.button("✅ 直接記錄（略過其餘）", self.finish, discord.ButtonStyle.success, row=4)
+            self.button("✅ 完成（略過其餘）", self.finish, discord.ButtonStyle.success, row=4)
             if len(reviews) > 1:
                 self.button("◀", self.turn(-1), disabled=self.index == 0, row=4)
                 self.button("▶", self.turn(1), disabled=self.index >= len(reviews) - 1, row=4)
@@ -1506,32 +1509,51 @@ class FlexReviewView(MenuView):
                    (json.dumps(decisions), match_id, self.interaction.guild_id, team_id))
         db.commit()
 
+    def close(self, gid):
+        match_id, team_id, _, _ = self.current
+        db.execute("DELETE FROM flex_reviews WHERE match_id=? AND guild_id=? AND team_id=?", (match_id, gid, team_id))
+        db.commit()
+
     async def decided(self, interaction, notice):
-        """After a decision: once every unlinked teammate is decided, record the game."""
+        """After a decision: once every unlinked teammate is decided, the game leaves the list."""
         self.interaction = interaction
         gid = interaction.guild_id
-        match_id, team_id, game, decisions = self.current
+        _, _, game, decisions = self.current
         linked = linked_puuids(gid)
         if all(p["puuid"] in linked or p["puuid"] in decisions for p in game["team"]):
-            notice = await self.record_now(gid) + "\n" + notice
+            self.close(gid)
+            notice += "\n✅ 呢場全部處理完。"
         await self.show(interaction, notice=notice)
 
-    async def record_now(self, gid):
-        match_id, team_id, game, _ = self.current
-        gone = db.execute("DELETE FROM flex_reviews WHERE match_id=? AND guild_id=? AND team_id=?",
-                          (match_id, gid, team_id)).rowcount
+    async def add_to_game(self, gid, member, p, game):
+        """A teammate linked after the game was recorded gets its result too."""
+        number = game.get("number")
+        row = db.execute("SELECT team_a FROM matches WHERE id=? AND guild_id=?", (number, gid)).fetchone()
+        if row is None:
+            return "（搵唔到嗰場記錄，冇補計）"
+        ids = str_to_ids(row[0])
+        if member.id in ids:
+            return "（佢已經喺呢場入面，冇重複計）"
+        won = game["won"]
+        record(gid, [member.id], won=won)
+        db.execute("UPDATE matches SET team_a=? WHERE id=?", (ids_to_str(ids + [member.id]), number))
         db.commit()
-        if not gone:  # already recorded (e.g. pressed twice)
-            return "呢場已經記錄咗。"
-        await finish_flex_game(gid, match_id, game)
-        names = "、".join(f"<@{uid}>" for uid, _ in team_members(gid, game))
-        return f"✅ 已記錄（{'贏' if game['won'] else '輸'}）並公佈：{names}"
+        sign = f"+{ELO_CHANGE}" if won else f"-{ELO_CHANGE}"
+        text = (f"{member.mention}（{riot_name(p)}）補計 Flex 第 {number} 場：{'贏了' if won else '輸了'}　"
+                f"{sign} → **{get_player(gid, member.id)[0]}**")
+        channel = client.get_channel(flex_channel(gid) or 0)
+        if channel:
+            try:
+                await channel.send(f"🔗 {text}")
+            except discord.HTTPException as e:
+                print(f"Couldn't announce late link: {e!r}")
+        return text
 
     def link_to(self, p, select):
         async def callback(interaction):
             gid = interaction.guild_id
             member = select.values[0]
-            _, _, game, decisions = self.current
+            _, _, game, _ = self.current
             owner = db.execute("SELECT user_id FROM riot_accounts WHERE guild_id=? AND puuid=?",
                                (gid, p["puuid"])).fetchone()
             count = db.execute("SELECT count(*) FROM riot_accounts WHERE guild_id=? AND user_id=?",
@@ -1547,7 +1569,9 @@ class FlexReviewView(MenuView):
                 db.execute("INSERT INTO riot_accounts VALUES (?, ?, ?, ?, ?, ?)",
                            (gid, member.id, p["puuid"], riot_name(p), game["server"], game["start"]))
                 db.commit()
-                await self.decided(interaction, f"🔗 {riot_name(p)} 已連結到 {member.mention}（之後嘅 Flex 都會計）")
+                added = await self.add_to_game(gid, member, p, game)
+                await self.decided(interaction,
+                                   f"🔗 {riot_name(p)} 已連結到 {member.mention}（之後嘅 Flex 都會計）\n{added}")
         return callback
 
     def skip(self, p):
@@ -1560,7 +1584,8 @@ class FlexReviewView(MenuView):
 
     async def finish(self, interaction):
         self.interaction = interaction
-        await self.show(interaction, notice=await self.record_now(interaction.guild_id))
+        self.close(interaction.guild_id)
+        await self.show(interaction, notice="⏭️ 已略過其餘隊友，呢場處理完。")
 
 
 @client.tree.command(name="flexreview", description="處理有未連結隊友的 Flex 場（只限 bot 擁有者）")
