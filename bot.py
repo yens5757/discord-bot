@@ -741,12 +741,32 @@ async def check_flex_games(session):
         await record_flex_game(match_id, data)
 
 
+async def refresh_accounts_if_key_changed(session):
+    """Riot encrypts account ids (puuid) differently for every API key, so after a key change
+    look every linked account up again. Only a fingerprint of the key is stored."""
+    fingerprint = hashlib.sha256(riot.api_key().encode()).hexdigest()[:16]
+    row = db.execute("SELECT value FROM meta WHERE key='riot_key'").fetchone()
+    if row and row[0] == fingerprint:
+        return
+    for gid, uid, old, riot_id in db.execute("SELECT guild_id, user_id, puuid, riot_id FROM riot_accounts").fetchall():
+        found = await resolve_riot_id(session, riot_id)
+        if found:
+            db.execute("UPDATE riot_accounts SET puuid=?, riot_id=?, server=? WHERE guild_id=? AND user_id=? AND puuid=?",
+                       (*found, gid, uid, old))
+        else:
+            print(f"Couldn't find {riot_id} with the new Riot key")
+    db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('riot_key', ?)", (fingerprint,))
+    db.commit()
+    print("Riot key changed: linked accounts refreshed")
+
+
 async def watch_flex():
     await client.wait_until_ready()
     async with aiohttp.ClientSession() as session:
         while True:
             if riot.api_key():
                 try:
+                    await refresh_accounts_if_key_changed(session)
                     await finish_pending_links(session)
                     await check_flex_games(session)
                 except Exception as e:  # e.g. an expired key: keep the bot running, try again later
