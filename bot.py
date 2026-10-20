@@ -393,7 +393,7 @@ async def result_flex(interaction: discord.Interaction,
         color=discord.Color.gold() if won else discord.Color.dark_grey(),
     )
     embed.set_footer(text=f"金幣：每人 +{CREDIT_WIN if won else CREDIT_LOSS}")
-    await interaction.response.send_message(embed=embed)
+    await interaction.response.send_message(embed=embed, ephemeral=True)  # only the reporter sees it
 
 
 client.tree.add_command(result_group)
