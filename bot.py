@@ -6,16 +6,19 @@ import os
 import random
 import shutil
 import sqlite3
+import time
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
 
+import aiohttp
 import discord
 from discord import app_commands
 from dotenv import load_dotenv
 from PIL import Image
 
 import champions
+import riot
 import wheel
 from reel import SECONDS as REEL_SECONDS
 from reel import render_reel_gif, render_reel_preview
@@ -88,6 +91,17 @@ if "champ_spins" not in player_cols:
     db.execute("ALTER TABLE players ADD COLUMN champ_spins INTEGER NOT NULL DEFAULT 0")
     db.execute("""UPDATE players SET champ_spins = (SELECT COUNT(*) FROM owned_styles o
         WHERE o.guild_id = players.guild_id AND o.user_id = players.user_id AND o.style LIKE 'champ:%')""")
+db.execute("""
+CREATE TABLE IF NOT EXISTS riot_accounts (
+    guild_id  INTEGER NOT NULL,
+    user_id   INTEGER NOT NULL,
+    puuid     TEXT NOT NULL,
+    riot_id   TEXT NOT NULL,                 -- 名字#TAG
+    server    TEXT NOT NULL,                 -- e.g. tw2
+    linked_at INTEGER NOT NULL,              -- unix time; only Flex games after this count
+    PRIMARY KEY (guild_id, user_id)
+)""")
+db.execute("CREATE TABLE IF NOT EXISTS riot_matches (match_id TEXT PRIMARY KEY, checked_at INTEGER NOT NULL)")
 db.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
 if db.execute("SELECT 1 FROM meta WHERE key='start_credits_given'").fetchone() is None:
     # one-time: existing players also get the starting credits
@@ -210,6 +224,7 @@ class Bot(discord.Client):
         print(f"Synced {len(synced)} slash commands")
         run_in_background(fill_spin_library())
         run_in_background(prepare_shop())
+        run_in_background(watch_flex())
 
 
 client = Bot()
@@ -397,6 +412,167 @@ async def result_flex(interaction: discord.Interaction,
 
 
 client.tree.add_command(result_group)
+
+
+# ---------- Riot: ranked Flex games recorded automatically ----------
+# Every few minutes, check linked players' ranked Flex games. A game where 2+ linked members
+# of the same server were on the same team is recorded like /result flex and announced.
+
+FLEX_CHECK_SECONDS = 300
+FLEX_LOOKBACK = 3 * 86400  # never look further back than this
+
+
+def flex_channel(guild_id):
+    row = db.execute("SELECT value FROM meta WHERE key=?", (f"flex_channel:{guild_id}",)).fetchone()
+    return int(row[0]) if row else None
+
+
+def champion_name(riot_name):
+    """Match data uses ids like 'Darius' (and 'FiddleSticks'); show the Chinese name."""
+    for cid, info in champions.CHAMPIONS.items():
+        if cid.lower() == riot_name.lower():
+            return info["name"]
+    return riot_name
+
+
+@client.tree.command(name="link", description="連結 Riot 帳號（自動記錄 Flex 積分場）")
+@app_commands.guild_only()
+@app_commands.describe(riot_id="Riot ID，例如 收網大師#TW2", user="要連結的玩家（只限 bot 擁有者幫人連結）")
+async def link(interaction: discord.Interaction, riot_id: str, user: discord.Member = None):
+    user = user or interaction.user
+    if user.id != interaction.user.id and interaction.user.id != client.owner_id:
+        await interaction.response.send_message("只有 bot 擁有者可以幫其他人連結。", ephemeral=True)
+        return
+    if not riot.api_key():
+        await interaction.response.send_message("Bot 未設定 Riot API key。", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    try:
+        async with aiohttp.ClientSession() as session:
+            acc = await riot.account(session, riot_id)
+            srv = await riot.server(session, acc["puuid"]) if acc else None
+    except riot.RiotError as e:
+        await interaction.followup.send(f"連接 Riot 失敗：{e}", ephemeral=True)
+        return
+    if not acc:
+        await interaction.followup.send(f"找不到 Riot ID「{riot_id}」，格式係 名字#TAG。", ephemeral=True)
+        return
+    name = f"{acc['gameName']}#{acc['tagLine']}"
+    get_player(interaction.guild_id, user.id)
+    db.execute("INSERT OR REPLACE INTO riot_accounts VALUES (?, ?, ?, ?, ?, ?)",
+               (interaction.guild_id, user.id, acc["puuid"], name, srv, int(time.time())))
+    db.commit()
+    await interaction.followup.send(
+        f"✅ {user.mention} 已連結 **{name}**（{srv}）。之後同其他已連結成員（2 人或以上同隊）"
+        f"打嘅 Flex 積分場會自動記錄。", ephemeral=True)
+
+
+@client.tree.command(name="unlink", description="取消連結 Riot 帳號")
+@app_commands.guild_only()
+@app_commands.describe(user="要取消連結的玩家（只限 bot 擁有者）")
+async def unlink(interaction: discord.Interaction, user: discord.Member = None):
+    user = user or interaction.user
+    if user.id != interaction.user.id and interaction.user.id != client.owner_id:
+        await interaction.response.send_message("只有 bot 擁有者可以幫其他人取消連結。", ephemeral=True)
+        return
+    gone = db.execute("DELETE FROM riot_accounts WHERE guild_id=? AND user_id=?",
+                      (interaction.guild_id, user.id)).rowcount
+    db.commit()
+    await interaction.response.send_message(
+        f"已取消 {user.mention} 的 Riot 連結。" if gone else f"{user.mention} 沒有連結 Riot 帳號。", ephemeral=True)
+
+
+@client.tree.command(name="flexchannel", description="設定自動 Flex 結果公佈的頻道（只限 bot 擁有者）")
+@app_commands.guild_only()
+async def flexchannel(interaction: discord.Interaction):
+    if interaction.user.id != client.owner_id:
+        await interaction.response.send_message("只有 bot 擁有者可以使用這個指令。", ephemeral=True)
+        return
+    db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+               (f"flex_channel:{interaction.guild_id}", str(interaction.channel_id)))
+    db.commit()
+    linked = db.execute("SELECT riot_id FROM riot_accounts WHERE guild_id=?", (interaction.guild_id,)).fetchall()
+    await interaction.response.send_message(
+        f"✅ 自動 Flex 結果會公佈喺呢個頻道。已連結 {len(linked)} 人："
+        + ("、".join(r[0] for r in linked) or "（未有）"), ephemeral=True)
+
+
+async def record_flex_game(match_id, data):
+    """Record a finished ranked Flex game for every server with 2+ linked members on one team."""
+    info = data["info"]
+    started = info["gameStartTimestamp"] // 1000
+    if info.get("gameDuration", 0) < 300:  # remake
+        return
+    players = {p["puuid"]: p for p in info["participants"]}
+    rows = db.execute("SELECT guild_id, user_id, puuid FROM riot_accounts WHERE linked_at <= ?", (started,))
+    teams = {}  # (guild, teamId) -> [(user_id, participant)]
+    for gid, uid, puuid in rows:
+        if puuid in players:
+            teams.setdefault((gid, players[puuid]["teamId"]), []).append((uid, players[puuid]))
+    for (gid, _), members in teams.items():
+        if len(members) < 2:
+            continue
+        ids = [uid for uid, _ in members]
+        won = members[0][1]["win"]
+        record(gid, ids, won=won)
+        cur = db.execute(
+            "INSERT INTO matches (guild_id, team_a, team_b, status, winner, mode) VALUES (?, ?, '', 'done', ?, 'flex')",
+            (gid, ids_to_str(ids), "win" if won else "loss"),
+        )
+        db.commit()
+        await announce_flex(gid, cur.lastrowid, match_id, info, members, won)
+
+
+async def announce_flex(gid, number, match_id, info, members, won):
+    channel_id = flex_channel(gid)
+    channel = client.get_channel(channel_id) if channel_id else None
+    if channel is None:
+        return
+    sign = f"+{ELO_CHANGE}" if won else f"-{ELO_CHANGE}"
+    lines = []
+    for uid, p in members:
+        kda = f"{p['kills']}/{p['deaths']}/{p['assists']}"
+        lines.append(f"<@{uid}> {champion_name(p['championName'])} {kda}　{sign} → **{get_player(gid, uid)[0]}**")
+    embed = discord.Embed(
+        title=f"🏆 Flex 第 {number} 場（自動記錄）：贏了！" if won else f"💀 Flex 第 {number} 場（自動記錄）：輸了",
+        description="\n".join(lines),
+        color=discord.Color.gold() if won else discord.Color.dark_grey(),
+    )
+    embed.set_footer(text=f"金幣：每人 +{CREDIT_WIN if won else CREDIT_LOSS}｜{info['gameDuration'] // 60} 分鐘｜{match_id}")
+    try:
+        await channel.send(embed=embed)
+    except discord.HTTPException as e:
+        print(f"Couldn't announce Flex game {match_id}: {e!r}")
+
+
+async def check_flex_games(session):
+    accounts = db.execute("SELECT puuid, server, MIN(linked_at) FROM riot_accounts GROUP BY puuid, server").fetchall()
+    found = {}
+    for puuid, srv, linked_at in accounts:
+        since = max(linked_at, int(time.time()) - FLEX_LOOKBACK)
+        for match_id in await riot.flex_match_ids(session, puuid, srv, since):
+            found[match_id] = srv
+    for match_id, srv in sorted(found.items()):
+        if db.execute("SELECT 1 FROM riot_matches WHERE match_id=?", (match_id,)).fetchone():
+            continue
+        data = await riot.match(session, srv, match_id)
+        if not data or not data["info"].get("gameEndTimestamp"):
+            continue  # not finished yet: look again next time
+        await record_flex_game(match_id, data)
+        db.execute("INSERT OR IGNORE INTO riot_matches VALUES (?, ?)", (match_id, int(time.time())))
+        db.commit()
+
+
+async def watch_flex():
+    await client.wait_until_ready()
+    async with aiohttp.ClientSession() as session:
+        while True:
+            if riot.api_key():
+                try:
+                    await check_flex_games(session)
+                except Exception as e:  # e.g. an expired key: keep the bot running, try again later
+                    print(f"Flex check failed: {e!r}")
+            await asyncio.sleep(FLEX_CHECK_SECONDS)
 
 
 # ---------- Admin / owner commands ----------
@@ -1186,7 +1362,8 @@ async def duo(interaction: discord.Interaction, kind: app_commands.Choice[str],
 async def lineup(interaction: discord.Interaction, kind: app_commands.Choice[str]):
     stats = {}
     for team, mode, won in team_results(interaction.guild_id):
-        add_result(stats, tuple(sorted(team)), mode, won)
+        if len(team) == 5:  # a line up is a full team (auto Flex games can have just 2-4 members)
+            add_result(stats, tuple(sorted(team)), mode, won)
 
     if not stats:
         await interaction.response.send_message("還沒有比賽記錄。")

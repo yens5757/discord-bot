@@ -17,6 +17,13 @@
 - `/result flex p1~p5 贏/輸`：記錄 5 人 Flex 結果，每人 ±20（結果只有自己看到）
 - `/cancel 編號`：取消比賽，不計 ELO
 
+### 自動記錄 Flex 積分場
+- `/link 名字#TAG`：連結你嘅 Riot 帳號（bot 擁有者可以幫其他人連結）；`/unlink` 取消
+- Bot 每 5 分鐘檢查已連結成員嘅 **Flex 積分場**：同一隊有 **2 人或以上**已連結成員，就會自動記錄勝負（ELO ±20、金幣），並喺指定頻道公佈每人用咩英雄同 KDA
+- `/flexchannel`：喺想公佈結果嘅頻道用（只限 bot 擁有者）
+- 只計連結之後打嘅場；重開（remake）唔計；10mix 自訂房 Riot 冇提供資料，仍然要用 `/result 10mix`
+- 需要喺 `.env` 加入 `RIOT_API_KEY=`（喺 developer.riotgames.com 申請）
+
 ### 統計
 - `/stat [玩家]`：個人戰績卡（ELO、金幣、10mix 及 Flex 勝負與勝率），用你套用咗嘅卡面畫出嚟
 - `/leaderboard`：ELO 前 10 名
