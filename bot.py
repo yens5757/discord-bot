@@ -101,6 +101,14 @@ CREATE TABLE IF NOT EXISTS riot_accounts (
     linked_at INTEGER NOT NULL,              -- unix time; only Flex games after this count
     PRIMARY KEY (guild_id, user_id)
 )""")
+db.execute("""
+CREATE TABLE IF NOT EXISTS riot_pending (    -- linked before the Riot API key was set
+    guild_id   INTEGER NOT NULL,
+    user_id    INTEGER NOT NULL,
+    riot_id    TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (guild_id, user_id)
+)""")
 db.execute("CREATE TABLE IF NOT EXISTS riot_matches (match_id TEXT PRIMARY KEY, checked_at INTEGER NOT NULL)")
 db.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
 if db.execute("SELECT 1 FROM meta WHERE key='start_credits_given'").fetchone() is None:
@@ -435,35 +443,77 @@ def champion_name(riot_name):
     return riot_name
 
 
+def riot_link(gid, uid):
+    """The Riot ID someone is linked to (or waiting to be linked to), or None."""
+    row = (db.execute("SELECT riot_id FROM riot_accounts WHERE guild_id=? AND user_id=?", (gid, uid)).fetchone()
+           or db.execute("SELECT riot_id FROM riot_pending WHERE guild_id=? AND user_id=?", (gid, uid)).fetchone())
+    return row[0] if row else None
+
+
+def riot_id_owner(gid, riot_id):
+    """Which member a Riot ID is already linked to, if any."""
+    for table in ("riot_accounts", "riot_pending"):
+        row = db.execute(f"SELECT user_id FROM {table} WHERE guild_id=? AND lower(riot_id)=lower(?)",
+                         (gid, riot_id)).fetchone()
+        if row:
+            return row[0]
+    return None
+
+
+async def resolve_riot_id(session, riot_id):
+    """'名字#TAG' -> (puuid, 'Name#TAG' as Riot spells it, server), or None if there's no such account."""
+    acc = await riot.account(session, riot_id)
+    if not acc:
+        return None
+    return acc["puuid"], f"{acc['gameName']}#{acc['tagLine']}", await riot.server(session, acc["puuid"])
+
+
 @client.tree.command(name="link", description="連結 Riot 帳號（自動記錄 Flex 積分場）")
 @app_commands.guild_only()
-@app_commands.describe(riot_id="Riot ID，例如 收網大師#TW2", user="要連結的玩家（只限 bot 擁有者幫人連結）")
+@app_commands.describe(riot_id="Riot ID，例如 收網大師#TW2", user="要連結的玩家（預設自己；可以幫未連結的人連結）")
 async def link(interaction: discord.Interaction, riot_id: str, user: discord.Member = None):
     user = user or interaction.user
-    if user.id != interaction.user.id and interaction.user.id != client.owner_id:
-        await interaction.response.send_message("只有 bot 擁有者可以幫其他人連結。", ephemeral=True)
+    gid, me = interaction.guild_id, interaction.user.id
+    current = riot_link(gid, user.id)
+    if current and user.id != me and me != client.owner_id:
+        await interaction.response.send_message(
+            f"{user.mention} 已經連結咗 **{current}**，只有本人或 bot 擁有者可以更改。", ephemeral=True)
         return
-    if not riot.api_key():
-        await interaction.response.send_message("Bot 未設定 Riot API key。", ephemeral=True)
+    name, _, tag = riot_id.strip().rpartition("#")
+    if not name or not tag:
+        await interaction.response.send_message("Riot ID 格式係 名字#TAG，例如 收網大師#TW2。", ephemeral=True)
         return
+    taken = riot_id_owner(gid, riot_id.strip())
+    if taken and taken != user.id:
+        await interaction.response.send_message(f"**{riot_id}** 已經連結咗 <@{taken}>。", ephemeral=True)
+        return
+
     await interaction.response.defer(ephemeral=True)
+    get_player(gid, user.id)
+    now = int(time.time())  # only Flex games from now on count
+    if not riot.api_key():  # no key yet: keep it, and finish linking once the key is set
+        db.execute("DELETE FROM riot_accounts WHERE guild_id=? AND user_id=?", (gid, user.id))
+        db.execute("INSERT OR REPLACE INTO riot_pending VALUES (?, ?, ?, ?)", (gid, user.id, riot_id.strip(), now))
+        db.commit()
+        await interaction.followup.send(
+            f"✅ {user.mention} → **{riot_id.strip()}** 已記錄，Riot API key 設定好之後會自動完成連結。"
+            f"由而家開始打嘅 Flex 積分場都會計。", ephemeral=True)
+        return
     try:
         async with aiohttp.ClientSession() as session:
-            acc = await riot.account(session, riot_id)
-            srv = await riot.server(session, acc["puuid"]) if acc else None
+            found = await resolve_riot_id(session, riot_id)
     except riot.RiotError as e:
         await interaction.followup.send(f"連接 Riot 失敗：{e}", ephemeral=True)
         return
-    if not acc:
+    if not found:
         await interaction.followup.send(f"找不到 Riot ID「{riot_id}」，格式係 名字#TAG。", ephemeral=True)
         return
-    name = f"{acc['gameName']}#{acc['tagLine']}"
-    get_player(interaction.guild_id, user.id)
-    db.execute("INSERT OR REPLACE INTO riot_accounts VALUES (?, ?, ?, ?, ?, ?)",
-               (interaction.guild_id, user.id, acc["puuid"], name, srv, int(time.time())))
+    puuid, proper, srv = found
+    db.execute("DELETE FROM riot_pending WHERE guild_id=? AND user_id=?", (gid, user.id))
+    db.execute("INSERT OR REPLACE INTO riot_accounts VALUES (?, ?, ?, ?, ?, ?)", (gid, user.id, puuid, proper, srv, now))
     db.commit()
     await interaction.followup.send(
-        f"✅ {user.mention} 已連結 **{name}**（{srv}）。之後同其他已連結成員（2 人或以上同隊）"
+        f"✅ {user.mention} 已連結 **{proper}**（{srv}）。由而家開始，同其他已連結成員（2 人或以上同隊）"
         f"打嘅 Flex 積分場會自動記錄。", ephemeral=True)
 
 
@@ -475,8 +525,10 @@ async def unlink(interaction: discord.Interaction, user: discord.Member = None):
     if user.id != interaction.user.id and interaction.user.id != client.owner_id:
         await interaction.response.send_message("只有 bot 擁有者可以幫其他人取消連結。", ephemeral=True)
         return
-    gone = db.execute("DELETE FROM riot_accounts WHERE guild_id=? AND user_id=?",
-                      (interaction.guild_id, user.id)).rowcount
+    gone = 0
+    for table in ("riot_accounts", "riot_pending"):
+        gone += db.execute(f"DELETE FROM {table} WHERE guild_id=? AND user_id=?",
+                           (interaction.guild_id, user.id)).rowcount
     db.commit()
     await interaction.response.send_message(
         f"已取消 {user.mention} 的 Riot 連結。" if gone else f"{user.mention} 沒有連結 Riot 帳號。", ephemeral=True)
@@ -488,13 +540,30 @@ async def flexchannel(interaction: discord.Interaction):
     if interaction.user.id != client.owner_id:
         await interaction.response.send_message("只有 bot 擁有者可以使用這個指令。", ephemeral=True)
         return
-    db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
-               (f"flex_channel:{interaction.guild_id}", str(interaction.channel_id)))
+    gid = interaction.guild_id
+    db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", (f"flex_channel:{gid}", str(interaction.channel_id)))
     db.commit()
-    linked = db.execute("SELECT riot_id FROM riot_accounts WHERE guild_id=?", (interaction.guild_id,)).fetchall()
-    await interaction.response.send_message(
-        f"✅ 自動 Flex 結果會公佈喺呢個頻道。已連結 {len(linked)} 人："
-        + ("、".join(r[0] for r in linked) or "（未有）"), ephemeral=True)
+    linked = [r[0] for r in db.execute("SELECT riot_id FROM riot_accounts WHERE guild_id=?", (gid,))]
+    pending = [r[0] for r in db.execute("SELECT riot_id FROM riot_pending WHERE guild_id=?", (gid,))]
+    text = f"✅ 自動 Flex 結果會公佈喺呢個頻道。\n已連結 {len(linked)} 人：" + ("、".join(linked) or "（未有）")
+    if pending:
+        text += f"\n等待 API key 完成連結 {len(pending)} 人：" + "、".join(pending)
+    await interaction.response.send_message(text, ephemeral=True)
+
+
+async def finish_pending_links(session):
+    """Links saved before the Riot API key was set: look the accounts up now."""
+    for gid, uid, riot_id, created in db.execute("SELECT * FROM riot_pending").fetchall():
+        found = await resolve_riot_id(session, riot_id)
+        db.execute("DELETE FROM riot_pending WHERE guild_id=? AND user_id=?", (gid, uid))
+        if found:
+            puuid, proper, srv = found
+            db.execute("INSERT OR REPLACE INTO riot_accounts VALUES (?, ?, ?, ?, ?, ?)",
+                       (gid, uid, puuid, proper, srv, created))
+            print(f"Linked {uid} to {proper} ({srv})")
+        else:
+            print(f"Couldn't link {uid}: no Riot account called {riot_id}")
+        db.commit()
 
 
 async def record_flex_game(match_id, data):
@@ -569,6 +638,7 @@ async def watch_flex():
         while True:
             if riot.api_key():
                 try:
+                    await finish_pending_links(session)
                     await check_flex_games(session)
                 except Exception as e:  # e.g. an expired key: keep the bot running, try again later
                     print(f"Flex check failed: {e!r}")
