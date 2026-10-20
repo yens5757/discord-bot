@@ -14,22 +14,34 @@
 
 ### 記錄結果
 - `/result 10mix 編號 勝方`：按兩隊實力差距加減 ELO（實力相同 ±20）
-- `/result flex p1~p5 贏/輸`：記錄 5 人 Flex 結果，每人 ±20（結果只有自己看到）
+- `/result flex p1~p5 贏/輸`：手動記錄 5 人 Flex 結果，每人 ±20（結果只有自己看到）；已連結 Riot 帳號嘅 Flex 積分場會自動記錄，唔使再手動
 - `/cancel 編號`：取消比賽，不計 ELO
 
 ### 自動記錄 Flex 積分場
-- `/link 名字#TAG [玩家]`：連結 Riot 帳號（只有自己看到，每人最多 2 個）；可以幫未連結嘅人連結，已連結嘅只有本人或 bot 擁有者可以更改；`/unlink` 取消
-- Bot 每 2 分鐘檢查已連結成員嘅 **Flex 積分場**：同一隊有 **3 人或以上**已連結成員，就會自動記錄勝負（ELO ±20、金幣），並喺指定頻道公佈每人用咩英雄同 KDA
-- `/flexchannel`：喺想公佈結果嘅頻道用（只限 bot 擁有者）
-- 如果嗰隊仲有**未連結**嘅隊友：已連結成員照樣即時計分同公佈，未連結嘅隊友會保留，bot 會私訊 bot 擁有者；用 `/flexreview`（只有自己看到）逐個揀「連結到某個成員」（佢會補計呢場）或者「略過」
-- 只計連結之後打嘅場；重開（remake）唔計；10mix 自訂房 Riot 冇提供資料，仍然要用 `/result 10mix`
-- 需要喺 `.env` 加入 `RIOT_API_KEY=`（喺 developer.riotgames.com 申請）
+**連結 Riot 帳號**（回覆只有自己看到）
+- `/link 名字#TAG`：連結自己嘅 Riot 帳號，**每人最多 2 個**（例如主帳同副帳）
+- `/link 名字#TAG 玩家`：幫**未連結**嘅人連結；已經有連結嘅人，只有本人或 bot 擁有者可以再加
+- `/unlink [名字#TAG]`：取消某個帳號，唔填就取消全部（bot 擁有者可以幫其他人取消）
+- 同一個 Riot 帳號唔可以連結俾兩個人
+
+**自動記錄**
+- Bot 每 2 分鐘檢查已連結帳號嘅 **Flex 積分場**（Solo/Duo、一般場、ARAM 唔計）
+- 同一隊有 **3 個或以上已連結成員**，場波就會自動記錄：每人 ELO ±20、贏 +20／輸 +5 金幣，並喺 `/flexchannel` 設定嘅頻道公佈每人用咩英雄同 KDA
+- 只計**連結之後**打嘅場；重開（remake）唔計；同一場唔會計兩次
+- 10mix 自訂房 Riot 冇提供資料，仍然要用 `/result 10mix`
+
+**未連結嘅隊友**
+- 如果嗰隊仲有未連結嘅隊友：已連結成員照樣即時計分同公佈，未連結嘅隊友會保留，bot 會私訊 bot 擁有者
+- bot 擁有者用 `/flexreview`（只有自己看到）逐個處理：
+  - 揀「連結到某個成員」：個 Riot 帳號會連結俾佢，佢**補計呢場**（頻道會公佈），之後嘅 Flex 都會自動計
+  - 「略過」：唔計佢
+  - 「完成（略過其餘）」：處理完呢場
 
 ### 統計
 - `/stat [玩家]`：個人戰績卡（ELO、金幣、10mix 及 Flex 勝負與勝率），用你套用咗嘅卡面畫出嚟
 - `/leaderboard`：ELO 前 10 名
 - `/duo 最強/炸裂 [玩家]`：和某人同隊時勝率最高／最低的隊友
-- `/lineup 最強/炸裂`：勝率最高／最低的 5 人陣容
+- `/lineup 最強/炸裂`：勝率最高／最低的 5 人陣容（只計 5 人齊嘅隊伍）
 
 上面嘅示範圖係四款特效卡面：黃金（左上）、彩虹（右上）、霓虹（左下）、暗紅（右下）。
 
@@ -87,6 +99,10 @@
 - `/setelo 玩家 數值`：直接修改 ELO（只限 bot 擁有者）
 - `/givecoins 玩家 數量`：送金幣給玩家（只限 bot 擁有者）
 - `/givecard 玩家 卡面`：送卡面給玩家，可以打字搜尋（例如 達瑞斯 / Darius / 黃金），頻道會公佈並顯示卡面預覽（只限 bot 擁有者）
+- `/flexchannel`：喺想公佈自動 Flex 結果嘅頻道用，會順便列出已連結嘅帳號（只限 bot 擁有者）
+- `/flexreview`：處理有未連結隊友嘅 Flex 場（只限 bot 擁有者）
+
+管理指令所有人都睇到，但只有 bot 擁有者（Developer Portal 入面擁有呢個 bot 嘅帳號）用到；想收埋可以喺「伺服器設定 → 整合 → 收網機械人」設定指令權限。
 
 ## 安裝及運行
 
@@ -94,16 +110,21 @@
    ```
    pip install -r requirements.txt
    ```
-2. 喺專案資料夾建立 `.env` 檔案，填入 Discord bot token：
+2. 喺專案資料夾建立 `.env` 檔案：
    ```
    DISCORD_TOKEN=你的token
+   RIOT_API_KEY=RGAPI-...
    ```
+   - `DISCORD_TOKEN`：Discord Developer Portal 嘅 bot token（必須）
+   - `RIOT_API_KEY`：自動記錄 Flex 用，喺 [developer.riotgames.com](https://developer.riotgames.com/) 申請（冇都可以運行，`/link` 會先記低，有 key 之後自動完成連結）。建議用 Personal / Project API key（唔會過期）；Development key 每 24 小時過期。轉 key 之後 bot 會自動重新查詢所有已連結帳號
 3. 運行：
    ```
    python bot.py
    ```
 
-戰績卡需要中文字型：Windows 會用微軟正黑體，macOS 用蘋方，Linux 需要安裝 Noto Sans CJK。
+第一次啟動會喺背景下載英雄資料同原畫（約 25 MB，`champ_data/`）、畫好轉盤動畫（約 250 MB，`spin_gifs/`）；卡面預覽會喺第一次用到時畫好（`card_previews/`）。呢啲資料夾都唔會上傳到 GitHub。
+
+戰績卡需要中文字型：Windows 會用微軟正黑體，macOS 用蘋方，Linux 需要安裝 Noto Sans CJK（Ubuntu：`sudo apt install fonts-noto-cjk`）。
 
 ---
 
