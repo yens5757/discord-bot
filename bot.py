@@ -91,24 +91,32 @@ if "champ_spins" not in player_cols:
     db.execute("ALTER TABLE players ADD COLUMN champ_spins INTEGER NOT NULL DEFAULT 0")
     db.execute("""UPDATE players SET champ_spins = (SELECT COUNT(*) FROM owned_styles o
         WHERE o.guild_id = players.guild_id AND o.user_id = players.user_id AND o.style LIKE 'champ:%')""")
-db.execute("""
-CREATE TABLE IF NOT EXISTS riot_accounts (
+RIOT_TABLES = {  # a member can link up to MAX_RIOT_ACCOUNTS Riot accounts
+    "riot_accounts": """(
     guild_id  INTEGER NOT NULL,
     user_id   INTEGER NOT NULL,
     puuid     TEXT NOT NULL,
     riot_id   TEXT NOT NULL,                 -- 名字#TAG
     server    TEXT NOT NULL,                 -- e.g. tw2
     linked_at INTEGER NOT NULL,              -- unix time; only Flex games after this count
-    PRIMARY KEY (guild_id, user_id)
-)""")
-db.execute("""
-CREATE TABLE IF NOT EXISTS riot_pending (    -- linked before the Riot API key was set
+    PRIMARY KEY (guild_id, user_id, puuid)
+)""",
+    "riot_pending": """(                      -- linked before the Riot API key was set
     guild_id   INTEGER NOT NULL,
     user_id    INTEGER NOT NULL,
     riot_id    TEXT NOT NULL,
     created_at INTEGER NOT NULL,
-    PRIMARY KEY (guild_id, user_id)
-)""")
+    PRIMARY KEY (guild_id, user_id, riot_id)
+)""",
+}
+for table, columns in RIOT_TABLES.items():
+    db.execute(f"CREATE TABLE IF NOT EXISTS {table} {columns}")
+    key = [r[1] for r in sorted(db.execute(f"PRAGMA table_info({table})"), key=lambda r: r[5]) if r[5]]
+    if key == ["guild_id", "user_id"]:  # older version allowed one account per member: widen the key
+        db.execute(f"ALTER TABLE {table} RENAME TO {table}_old")
+        db.execute(f"CREATE TABLE {table} {columns}")
+        db.execute(f"INSERT INTO {table} SELECT * FROM {table}_old")
+        db.execute(f"DROP TABLE {table}_old")
 db.execute("CREATE TABLE IF NOT EXISTS riot_matches (match_id TEXT PRIMARY KEY, checked_at INTEGER NOT NULL)")
 db.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
 if db.execute("SELECT 1 FROM meta WHERE key='start_credits_given'").fetchone() is None:
@@ -423,11 +431,13 @@ client.tree.add_command(result_group)
 
 
 # ---------- Riot: ranked Flex games recorded automatically ----------
-# Every few minutes, check linked players' ranked Flex games. A game where 2+ linked members
+# Every few minutes, check linked players' ranked Flex games. A game where 3+ linked members
 # of the same server were on the same team is recorded like /result flex and announced.
 
-FLEX_CHECK_SECONDS = 300
+FLEX_CHECK_SECONDS = 120  # ~12 accounts = ~12 requests per check; Riot allows 100 per 2 minutes
 FLEX_LOOKBACK = 3 * 86400  # never look further back than this
+MIN_FLEX_MEMBERS = 3      # linked members needed on one team for a game to count
+MAX_RIOT_ACCOUNTS = 2     # Riot accounts one member can link
 
 
 def flex_channel(guild_id):
@@ -443,11 +453,10 @@ def champion_name(riot_name):
     return riot_name
 
 
-def riot_link(gid, uid):
-    """The Riot ID someone is linked to (or waiting to be linked to), or None."""
-    row = (db.execute("SELECT riot_id FROM riot_accounts WHERE guild_id=? AND user_id=?", (gid, uid)).fetchone()
-           or db.execute("SELECT riot_id FROM riot_pending WHERE guild_id=? AND user_id=?", (gid, uid)).fetchone())
-    return row[0] if row else None
+def riot_links(gid, uid):
+    """Riot IDs a member is linked to (or waiting to be linked to)."""
+    return [r[0] for table in ("riot_accounts", "riot_pending")
+            for r in db.execute(f"SELECT riot_id FROM {table} WHERE guild_id=? AND user_id=?", (gid, uid))]
 
 
 def riot_id_owner(gid, riot_id):
@@ -468,35 +477,41 @@ async def resolve_riot_id(session, riot_id):
     return acc["puuid"], f"{acc['gameName']}#{acc['tagLine']}", await riot.server(session, acc["puuid"])
 
 
-@client.tree.command(name="link", description="連結 Riot 帳號（自動記錄 Flex 積分場）")
+@client.tree.command(name="link", description=f"連結 Riot 帳號（自動記錄 Flex 積分場，每人最多 {MAX_RIOT_ACCOUNTS} 個）")
 @app_commands.guild_only()
 @app_commands.describe(riot_id="Riot ID，例如 收網大師#TW2", user="要連結的玩家（預設自己；可以幫未連結的人連結）")
 async def link(interaction: discord.Interaction, riot_id: str, user: discord.Member = None):
     user = user or interaction.user
     gid, me = interaction.guild_id, interaction.user.id
-    current = riot_link(gid, user.id)
+    riot_id = riot_id.strip()
+    current = riot_links(gid, user.id)
     if current and user.id != me and me != client.owner_id:
         await interaction.response.send_message(
-            f"{user.mention} 已經連結咗 **{current}**，只有本人或 bot 擁有者可以更改。", ephemeral=True)
+            f"{user.mention} 已經連結咗 **{'、'.join(current)}**，只有本人或 bot 擁有者可以再加。", ephemeral=True)
         return
-    name, _, tag = riot_id.strip().rpartition("#")
+    name, _, tag = riot_id.rpartition("#")
     if not name or not tag:
         await interaction.response.send_message("Riot ID 格式係 名字#TAG，例如 收網大師#TW2。", ephemeral=True)
         return
-    taken = riot_id_owner(gid, riot_id.strip())
-    if taken and taken != user.id:
-        await interaction.response.send_message(f"**{riot_id}** 已經連結咗 <@{taken}>。", ephemeral=True)
+    taken = riot_id_owner(gid, riot_id)
+    if taken:
+        text = "已經連結咗呢個帳號。" if taken == user.id else f"**{riot_id}** 已經連結咗 <@{taken}>。"
+        await interaction.response.send_message(text, ephemeral=True)
+        return
+    if len(current) >= MAX_RIOT_ACCOUNTS:
+        await interaction.response.send_message(
+            f"{user.mention} 已經連結咗 {MAX_RIOT_ACCOUNTS} 個帳號（{'、'.join(current)}），"
+            f"請先用 /unlink 取消一個。", ephemeral=True)
         return
 
     await interaction.response.defer(ephemeral=True)
     get_player(gid, user.id)
     now = int(time.time())  # only Flex games from now on count
     if not riot.api_key():  # no key yet: keep it, and finish linking once the key is set
-        db.execute("DELETE FROM riot_accounts WHERE guild_id=? AND user_id=?", (gid, user.id))
-        db.execute("INSERT OR REPLACE INTO riot_pending VALUES (?, ?, ?, ?)", (gid, user.id, riot_id.strip(), now))
+        db.execute("INSERT OR IGNORE INTO riot_pending VALUES (?, ?, ?, ?)", (gid, user.id, riot_id, now))
         db.commit()
         await interaction.followup.send(
-            f"✅ {user.mention} → **{riot_id.strip()}** 已記錄，Riot API key 設定好之後會自動完成連結。"
+            f"✅ {user.mention} → **{riot_id}** 已記錄，Riot API key 設定好之後會自動完成連結。"
             f"由而家開始打嘅 Flex 積分場都會計。", ephemeral=True)
         return
     try:
@@ -509,29 +524,38 @@ async def link(interaction: discord.Interaction, riot_id: str, user: discord.Mem
         await interaction.followup.send(f"找不到 Riot ID「{riot_id}」，格式係 名字#TAG。", ephemeral=True)
         return
     puuid, proper, srv = found
-    db.execute("DELETE FROM riot_pending WHERE guild_id=? AND user_id=?", (gid, user.id))
-    db.execute("INSERT OR REPLACE INTO riot_accounts VALUES (?, ?, ?, ?, ?, ?)", (gid, user.id, puuid, proper, srv, now))
+    other = db.execute("SELECT user_id FROM riot_accounts WHERE guild_id=? AND puuid=?", (gid, puuid)).fetchone()
+    if other:  # same account under an older name
+        await interaction.followup.send(f"**{proper}** 已經連結咗 <@{other[0]}>。", ephemeral=True)
+        return
+    db.execute("INSERT INTO riot_accounts VALUES (?, ?, ?, ?, ?, ?)", (gid, user.id, puuid, proper, srv, now))
     db.commit()
     await interaction.followup.send(
-        f"✅ {user.mention} 已連結 **{proper}**（{srv}）。由而家開始，同其他已連結成員（2 人或以上同隊）"
+        f"✅ {user.mention} 已連結 **{proper}**（{srv}）。由而家開始，同其他已連結成員（{MIN_FLEX_MEMBERS} 人或以上同隊）"
         f"打嘅 Flex 積分場會自動記錄。", ephemeral=True)
 
 
 @client.tree.command(name="unlink", description="取消連結 Riot 帳號")
 @app_commands.guild_only()
-@app_commands.describe(user="要取消連結的玩家（只限 bot 擁有者）")
-async def unlink(interaction: discord.Interaction, user: discord.Member = None):
+@app_commands.describe(riot_id="只取消呢個帳號（預設全部）", user="要取消連結的玩家（只限 bot 擁有者）")
+async def unlink(interaction: discord.Interaction, riot_id: str = None, user: discord.Member = None):
     user = user or interaction.user
     if user.id != interaction.user.id and interaction.user.id != client.owner_id:
         await interaction.response.send_message("只有 bot 擁有者可以幫其他人取消連結。", ephemeral=True)
         return
-    gone = 0
+    gone = []
     for table in ("riot_accounts", "riot_pending"):
-        gone += db.execute(f"DELETE FROM {table} WHERE guild_id=? AND user_id=?",
-                           (interaction.guild_id, user.id)).rowcount
+        query = f"FROM {table} WHERE guild_id=? AND user_id=?"
+        args = [interaction.guild_id, user.id]
+        if riot_id:
+            query += " AND lower(riot_id)=lower(?)"
+            args.append(riot_id.strip())
+        gone += [r[0] for r in db.execute(f"SELECT riot_id {query}", args)]
+        db.execute(f"DELETE {query}", args)
     db.commit()
     await interaction.response.send_message(
-        f"已取消 {user.mention} 的 Riot 連結。" if gone else f"{user.mention} 沒有連結 Riot 帳號。", ephemeral=True)
+        f"已取消 {user.mention} 的連結：{'、'.join(gone)}" if gone else f"{user.mention} 沒有連結這個 Riot 帳號。",
+        ephemeral=True)
 
 
 @client.tree.command(name="flexchannel", description="設定自動 Flex 結果公佈的頻道（只限 bot 擁有者）")
@@ -545,9 +569,9 @@ async def flexchannel(interaction: discord.Interaction):
     db.commit()
     linked = [r[0] for r in db.execute("SELECT riot_id FROM riot_accounts WHERE guild_id=?", (gid,))]
     pending = [r[0] for r in db.execute("SELECT riot_id FROM riot_pending WHERE guild_id=?", (gid,))]
-    text = f"✅ 自動 Flex 結果會公佈喺呢個頻道。\n已連結 {len(linked)} 人：" + ("、".join(linked) or "（未有）")
+    text = f"✅ 自動 Flex 結果會公佈喺呢個頻道。\n已連結 {len(linked)} 個帳號：" + ("、".join(linked) or "（未有）")
     if pending:
-        text += f"\n等待 API key 完成連結 {len(pending)} 人：" + "、".join(pending)
+        text += f"\n等待完成連結 {len(pending)} 個：" + "、".join(pending)
     await interaction.response.send_message(text, ephemeral=True)
 
 
@@ -555,10 +579,10 @@ async def finish_pending_links(session):
     """Links saved before the Riot API key was set: look the accounts up now."""
     for gid, uid, riot_id, created in db.execute("SELECT * FROM riot_pending").fetchall():
         found = await resolve_riot_id(session, riot_id)
-        db.execute("DELETE FROM riot_pending WHERE guild_id=? AND user_id=?", (gid, uid))
+        db.execute("DELETE FROM riot_pending WHERE guild_id=? AND user_id=? AND riot_id=?", (gid, uid, riot_id))
         if found:
             puuid, proper, srv = found
-            db.execute("INSERT OR REPLACE INTO riot_accounts VALUES (?, ?, ?, ?, ?, ?)",
+            db.execute("INSERT OR IGNORE INTO riot_accounts VALUES (?, ?, ?, ?, ?, ?)",
                        (gid, uid, puuid, proper, srv, created))
             print(f"Linked {uid} to {proper} ({srv})")
         else:
@@ -567,20 +591,21 @@ async def finish_pending_links(session):
 
 
 async def record_flex_game(match_id, data):
-    """Record a finished ranked Flex game for every server with 2+ linked members on one team."""
+    """Record a finished ranked Flex game for every server with 3+ linked members on one team."""
     info = data["info"]
     started = info["gameStartTimestamp"] // 1000
     if info.get("gameDuration", 0) < 300:  # remake
         return
     players = {p["puuid"]: p for p in info["participants"]}
     rows = db.execute("SELECT guild_id, user_id, puuid FROM riot_accounts WHERE linked_at <= ?", (started,))
-    teams = {}  # (guild, teamId) -> [(user_id, participant)]
+    teams = {}  # (guild, teamId) -> {user_id: participant}
     for gid, uid, puuid in rows:
         if puuid in players:
-            teams.setdefault((gid, players[puuid]["teamId"]), []).append((uid, players[puuid]))
-    for (gid, _), members in teams.items():
-        if len(members) < 2:
+            teams.setdefault((gid, players[puuid]["teamId"]), {})[uid] = players[puuid]
+    for (gid, _), found in teams.items():
+        if len(found) < MIN_FLEX_MEMBERS:
             continue
+        members = list(found.items())
         ids = [uid for uid, _ in members]
         won = members[0][1]["win"]
         record(gid, ids, won=won)
