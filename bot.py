@@ -912,23 +912,31 @@ async def stat(interaction: discord.Interaction, user: discord.Member = None):
     await interaction.followup.send(file=discord.File(png, filename="stat.png"))
 
 
-@client.tree.command(name="leaderboard", description="ELO 排行榜")
+@client.tree.command(name="leaderboard", description="ELO 排行榜：最強 / 炸裂")
 @app_commands.guild_only()
-async def leaderboard(interaction: discord.Interaction):
-    rows = db.execute(
-        "SELECT user_id, elo, wins, losses FROM players WHERE guild_id=? "
-        "ORDER BY elo DESC LIMIT 10",
+@app_commands.describe(kind="最強（ELO 最高）或炸裂（ELO 最低）")
+@app_commands.choices(kind=[
+    app_commands.Choice(name="最強（ELO 最高）", value="best"),
+    app_commands.Choice(name="炸裂（ELO 最低）", value="worst"),
+])
+async def leaderboard(interaction: discord.Interaction, kind: app_commands.Choice[str]):
+    best = kind.value == "best"
+    rows = db.execute(  # only people who have played (0 勝 0 負 left out)
+        "SELECT user_id, elo, wins, losses FROM players WHERE guild_id=? AND wins + losses > 0 "
+        + ("ORDER BY elo DESC, wins DESC LIMIT 10" if best else "ORDER BY elo ASC, losses DESC LIMIT 10"),
         (interaction.guild_id,),
     ).fetchall()
     if not rows:
-        await interaction.response.send_message("還沒有人有 ELO 記錄。")
+        await interaction.response.send_message("還沒有人打過比賽。")
         return
-    medals = ["🥇", "🥈", "🥉"]
+    medals = ["🥇", "🥈", "🥉"] if best else ["💥", "💥", "💥"]
     lines = [
         f"{medals[i] if i < 3 else f'{i + 1}.'} <@{u}> — {rating}（{w} 勝 {l} 負）"
         for i, (u, rating, w, l) in enumerate(rows)
     ]
-    embed = discord.Embed(title="🏅 ELO 排行榜", description="\n".join(lines), color=discord.Color.gold())
+    embed = discord.Embed(title="🏅 ELO 排行榜：最強" if best else "💥 ELO 排行榜：炸裂",
+                          description="\n".join(lines),
+                          color=discord.Color.gold() if best else discord.Color.dark_red())
     await interaction.response.send_message(embed=embed)
 
 
@@ -1585,14 +1593,37 @@ class FlexReviewView(MenuView):
             elif count >= MAX_RIOT_ACCOUNTS:
                 await self.show(interaction, notice=f"{member.mention} 已經連結咗 {MAX_RIOT_ACCOUNTS} 個帳號。")
             else:
+                # every held game this account played in, not only the one on screen
+                games = [g for _, _, g, _ in self.load(gid) if any(q["puuid"] == p["puuid"] for q in g["team"])]
                 get_player(gid, member.id)
                 db.execute("INSERT INTO riot_accounts VALUES (?, ?, ?, ?, ?, ?)",
-                           (gid, member.id, p["puuid"], riot_name(p), game["server"], game["start"]))
+                           (gid, member.id, p["puuid"], riot_name(p), game["server"],
+                            min([g["start"] for g in games] + [game["start"]])))
                 db.commit()
-                added = await self.add_to_game(gid, member, p, game)
-                await self.decided(interaction,
-                                   f"🔗 {riot_name(p)} 已連結到 {member.mention}（之後嘅 Flex 都會計）\n{added}")
+                added = []
+                for g in games:
+                    q = next(q for q in g["team"] if q["puuid"] == p["puuid"])
+                    added.append(await self.add_to_game(gid, member, q, g))
+                done = self.close_finished(gid)
+                notice = (f"🔗 {riot_name(p)} 已連結到 {member.mention}（之後嘅 Flex 都會計）\n"
+                          f"補計 {len(added)} 場：\n" + "\n".join(added))
+                if done:
+                    notice += f"\n✅ {done} 場已經全部處理完。"
+                self.interaction = interaction
+                await self.show(interaction, notice=notice)
         return callback
+
+    def close_finished(self, gid):
+        """Drop held games where every teammate is now linked or skipped. Returns how many."""
+        linked = linked_puuids(gid)
+        done = 0
+        for match_id, team_id, g, decisions in self.load(gid):
+            if all(q["puuid"] in linked or q["puuid"] in decisions for q in g["team"]):
+                db.execute("DELETE FROM flex_reviews WHERE match_id=? AND guild_id=? AND team_id=?",
+                           (match_id, gid, team_id))
+                done += 1
+        db.commit()
+        return done
 
     def skip(self, p):
         async def callback(interaction):
