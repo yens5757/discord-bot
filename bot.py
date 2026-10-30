@@ -645,6 +645,7 @@ async def record_flex_game(match_id, data):
                 "server": info.get("platformId", riot.DEFAULT_SERVER).lower(), "team": team}
         number = await finish_flex_game(gid, match_id, game)  # linked members count straight away
         linked = linked_puuids(gid)
+        await warn_double_links(gid, match_id, team, linked)
         if any(p["puuid"] not in linked for p in team):  # unlinked teammates wait for the owner
             game["number"] = number
             held = db.execute("INSERT OR IGNORE INTO flex_reviews VALUES (?, ?, ?, ?, '{}', ?)",
@@ -687,6 +688,23 @@ def review_embed(gid, match_id, game, decisions):
         description="\n".join(lines) + "\n\n✅ 已連結成員已經計分　❓ 未連結的隊友：連結到成員（會補計呢場）或者略過",
         color=discord.Color.blurple(),
     ).set_footer(text=match_id)
+
+
+async def warn_double_links(gid, match_id, team, linked):
+    """Two players on one team linked to the same member: one of those links must be wrong."""
+    by_user = {}
+    for p in team:
+        if p["puuid"] in linked:
+            by_user.setdefault(linked[p["puuid"]], []).append(riot_name(p))
+    for uid, accounts in by_user.items():
+        if len(accounts) < 2:
+            continue
+        try:
+            owner = client.get_user(client.owner_id) or await client.fetch_user(client.owner_id)
+            await owner.send(f"⚠️ {'、'.join(accounts)} 喺同一場（{match_id}）同一隊，但都連結咗 <@{uid}>，"
+                             f"其中一個應該連結錯咗：佢只計咗一次，另一個玩家冇計分。用 /unlink 改返。")
+        except discord.HTTPException as e:
+            print(f"Couldn't DM the owner about double links in {match_id}: {e!r}")
 
 
 async def tell_owner_about_review(gid, match_id, game):
@@ -1579,6 +1597,7 @@ class FlexReviewView(MenuView):
 
     def link_to(self, p, select):
         async def callback(interaction):
+            await interaction.response.defer()  # adding several games can take longer than Discord's 3 seconds
             gid = interaction.guild_id
             member = select.values[0]
             _, _, game, _ = self.current
@@ -1586,10 +1605,17 @@ class FlexReviewView(MenuView):
                                (gid, p["puuid"])).fetchone()
             count = db.execute("SELECT count(*) FROM riot_accounts WHERE guild_id=? AND user_id=?",
                                (gid, member.id)).fetchone()[0]
+            linked = linked_puuids(gid)
+            # one person can't be two players in the same game
+            same_game = any(any(linked.get(q["puuid"]) == member.id for q in g["team"])
+                            for _, _, g, _ in self.load(gid) if any(q["puuid"] == p["puuid"] for q in g["team"]))
             if member.bot:
                 await self.show(interaction, notice="不能連結 bot。")
             elif owner:
                 await self.show(interaction, notice=f"{riot_name(p)} 已經連結咗 <@{owner[0]}>。")
+            elif same_game:
+                await self.show(interaction, notice=f"{member.mention} 已經用另一個帳號同 {riot_name(p)} "
+                                                    f"喺同一場打，{riot_name(p)} 唔可能係佢，請揀第二個人。")
             elif count >= MAX_RIOT_ACCOUNTS:
                 await self.show(interaction, notice=f"{member.mention} 已經連結咗 {MAX_RIOT_ACCOUNTS} 個帳號。")
             else:
