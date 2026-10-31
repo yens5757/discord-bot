@@ -1716,25 +1716,28 @@ def totals(rec):
 
 
 def ranked(stats, best, limit=5):
-    """Top entries by overall win rate (ties: more games first)."""
+    """Top entries by net wins (wins - losses), so 4-1 (+3) beats a lucky 1-0 (+1).
+    Ties: better win rate, then more games."""
     def key(item):
         games, wins = totals(item[1])
-        return (-wins / games if best else wins / games, -games)
+        net, rate = 2 * wins - games, wins / games
+        return (-net, -rate, -games) if best else (net, rate, -games)
     return sorted(stats.items(), key=key)[:limit]
 
 
 def record_text(rec):
     games, wins = totals(rec)
-    return f"**{wins / games:.0%}**（{wins} 勝 {games - wins} 負）"
+    net = 2 * wins - games
+    return f"**{'±0' if net == 0 else f'{net:+d}'}**（{wins} 勝 {games - wins} 負，{wins / games:.0%}）"
 
 
 KIND_CHOICES = [
-    app_commands.Choice(name="最強（最高勝率）", value="best"),
-    app_commands.Choice(name="炸裂（最低勝率）", value="worst"),
+    app_commands.Choice(name="最強（淨勝最多）", value="best"),
+    app_commands.Choice(name="炸裂（淨負最多）", value="worst"),
 ]
 
 
-@client.tree.command(name="duo", description="同邊勝率最高 / 最低的隊友")
+@client.tree.command(name="duo", description="同邊淨勝最多 / 最少的隊友")
 @app_commands.guild_only()
 @app_commands.describe(kind="最強或炸裂", user="要查看的玩家（預設自己）")
 @app_commands.choices(kind=KIND_CHOICES)
@@ -1766,7 +1769,7 @@ async def duo(interaction: discord.Interaction, kind: app_commands.Choice[str],
     await interaction.response.send_message(embed=embed)
 
 
-@client.tree.command(name="lineup", description="最強 / 炸裂 line up")
+@client.tree.command(name="lineup", description="最強 / 炸裂 line up（按淨勝排）")
 @app_commands.guild_only()
 @app_commands.describe(kind="最強或炸裂")
 @app_commands.choices(kind=KIND_CHOICES)
