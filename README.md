@@ -98,6 +98,7 @@
 ### 管理
 - `/setelo 玩家 數值`：直接修改 ELO（只限 bot 擁有者）
 - `/givecoins 玩家 數量`：送金幣給玩家（只限 bot 擁有者）
+- `/givecoinsall 數量`：送金幣俾所有玩家（bot 有記錄嘅人），頻道公佈但唔會 tag 任何人（只限 bot 擁有者）
 - `/givecard 玩家 卡面`：送卡面給玩家，可以打字搜尋（例如 達瑞斯 / Darius / 黃金），頻道會公佈並顯示卡面預覽（只限 bot 擁有者）
 - `/flexchannel`：喺想公佈自動 Flex 結果嘅頻道用，會順便列出已連結嘅帳號（只限 bot 擁有者）
 - `/flexreview`：處理有未連結隊友嘅 Flex 場（只限 bot 擁有者）
