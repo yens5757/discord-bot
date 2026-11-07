@@ -963,7 +963,7 @@ async def leaderboard(interaction: discord.Interaction, kind: app_commands.Choic
         return
     medals = ["🥇", "🥈", "🥉"] if best else ["💥", "💥", "💥"]
     lines = [
-        f"{medals[i] if i < 3 else f'{i + 1}.'} <@{u}> — {rating}（{w} 勝 {l} 負）"
+        f"{medals[i] if i < 3 else f'{i + 1}.'} <@{u}> — {rating}（{w} 勝 {l} 負，{w / (w + l):.0%}）"
         for i, (u, rating, w, l) in enumerate(rows)
     ]
     embed = discord.Embed(title="🏅 ELO 排行榜：最強" if best else "💥 ELO 排行榜：炸裂",
@@ -1352,6 +1352,45 @@ def champion_reel_png():
     return _champion_reel_png[count]
 
 
+SPIN10_COST = SPIN_COST * 10
+# best-looking prize first: its animation is shown for a 10-spin
+PRIZE_RANK = ["rainbow", "jackpot", "c100", "again2", "c50", "again", "c25", "c15", "c10", "net"]
+
+
+def apply_lucky_prize(gid, uid, owned):
+    """Roll the 幸運轉盤 once and give the prize. `owned` (card styles) is updated if a card is won.
+    Returns (prize key, result text, newly won card or None). The caller commits."""
+    key, label, _, kind, value = PRIZES[roll()]
+    won_card = None
+    if kind == "coins":
+        db.execute("UPDATE players SET credits = credits + ? WHERE guild_id=? AND user_id=?", (value, gid, uid))
+        result = "🕸️ 被收網了，甚麼都沒有！" if value == 0 else f"🪙 獲得 **{value} 金幣**！"
+        if key == "jackpot":
+            result = f"💰 **JACKPOT！** 獲得 **{value} 金幣**！"
+    elif kind == "again":
+        db.execute("UPDATE players SET bonus_spins = bonus_spins + ? WHERE guild_id=? AND user_id=?", (value, gid, uid))
+        result = f"🔄 獲得**{'一次' if value == 1 else f'{value} 次'}免費加轉**！"
+    else:  # style
+        style_label = STYLES[value][0]
+        if value in owned:
+            db.execute("UPDATE players SET credits = credits + ? WHERE guild_id=? AND user_id=?", (STYLE_REFUND, gid, uid))
+            result = f"🌈 **超級 JACKPOT！** 抽中「{style_label}」，但你已經擁有，換成 **{STYLE_REFUND} 金幣**！"
+        else:
+            db.execute("INSERT INTO owned_styles (guild_id, user_id, style) VALUES (?, ?, ?)", (gid, uid, value))
+            owned.add(value)
+            won_card = value
+            result = f"🌈 **超級 JACKPOT！！** 抽中限定卡面「**{style_label}**」！用 /shop →「更換卡面」套用"
+    return key, result, won_card
+
+
+async def spin_gif_for(key):
+    variants = spin_variants(key)
+    if variants:
+        run_in_background(refresh_spin_gif(key))
+        return await asyncio.to_thread(random.choice(variants).read_bytes)
+    return await draw_spin_gif(key, 0)  # library still being drawn, e.g. right after wheel.py changed
+
+
 class SpinView(MenuView):
     """/spin: pick a wheel, see it, spin it. The spin itself is shown to everyone in the channel."""
 
@@ -1387,6 +1426,8 @@ class SpinView(MenuView):
                                  f"你的金幣：**{credits:,}**\n\n{odds}")
             embed.set_image(url="attachment://wheel.png")
             self.button(f"🎡 轉！（{payment}）", self.lucky_spin, discord.ButtonStyle.success, disabled=not can_pay)
+            self.button(f"🎡 十連轉（{SPIN10_COST} 金幣）", self.lucky_spin10, discord.ButtonStyle.primary,
+                        disabled=credits < SPIN10_COST)
             self.button("⬅ 返回", self.go("home"))
 
         else:  # champion
@@ -1427,42 +1468,12 @@ class SpinView(MenuView):
                 db.execute("UPDATE players SET credits = credits - ? WHERE guild_id=? AND user_id=?",
                            (SPIN_COST, gid, uid))
 
-            # draw the prize and apply it
-            won_card = None
-            index = roll()
-            key, label, _, kind, value = PRIZES[index]
-            if kind == "coins":
-                db.execute("UPDATE players SET credits = credits + ? WHERE guild_id=? AND user_id=?", (value, gid, uid))
-                result = "🕸️ 被收網了，甚麼都沒有！" if value == 0 else f"🪙 獲得 **{value} 金幣**！"
-                if key == "jackpot":
-                    result = f"💰 **JACKPOT！** 獲得 **{value} 金幣**！"
-            elif kind == "again":
-                db.execute(
-                    "UPDATE players SET bonus_spins = bonus_spins + ? WHERE guild_id=? AND user_id=?", (value, gid, uid)
-                )
-                times = "一次" if value == 1 else f"{value} 次"
-                result = f"🔄 獲得**{times}免費加轉**！"
-            else:  # style
-                style_label = STYLES[value][0]
-                if value in owned:
-                    db.execute(
-                        "UPDATE players SET credits = credits + ? WHERE guild_id=? AND user_id=?", (STYLE_REFUND, gid, uid)
-                    )
-                    result = f"🌈 **超級 JACKPOT！** 抽中「{style_label}」，但你已經擁有，換成 **{STYLE_REFUND} 金幣**！"
-                else:
-                    db.execute("INSERT INTO owned_styles (guild_id, user_id, style) VALUES (?, ?, ?)", (gid, uid, value))
-                    won_card = value
-                    result = f"🌈 **超級 JACKPOT！！** 抽中限定卡面「**{style_label}**」！用 /shop →「更換卡面」套用"
+            key, result, won_card = apply_lucky_prize(gid, uid, owned)
             db.commit()
             balance = get_wallet(gid, uid)[0]
         await self.show(interaction, notice="🎡 轉盤轉緊，結果請看頻道！")
 
-        variants = spin_variants(key)
-        if variants:
-            gif = await asyncio.to_thread(random.choice(variants).read_bytes)
-            run_in_background(refresh_spin_gif(key))
-        else:  # library still being drawn, e.g. right after wheel.py changed
-            gif = await draw_spin_gif(key, 0)
+        gif = await spin_gif_for(key)
         who = interaction.user.mention
         msg = await interaction.followup.send(
             content=f"🎡 {who} 轉動了幸運轉盤（{paid_with}）……",
@@ -1472,6 +1483,43 @@ class SpinView(MenuView):
         preview = asyncio.create_task(card_preview(won_card)) if won_card else None  # drawn while the wheel spins
         await asyncio.sleep(2.6)  # let the wheel stop before revealing the result
         await msg.edit(content=f"🎡 {who} 轉動了幸運轉盤（{paid_with}）\n{result}\n剩餘金幣：{balance:,}")
+        if preview:
+            await attach_card(msg, preview)
+
+    async def lucky_spin10(self, interaction):
+        """10 paid spins at once: one message with the best prize's animation and every result."""
+        gid, uid = interaction.guild_id, interaction.user.id
+        async with spin_lock:
+            credits, _, owned = get_wallet(gid, uid)
+            if credits < SPIN10_COST:
+                await self.show(interaction, notice=f"金幣不足（十連轉需要 {SPIN10_COST}，你有 {credits}）。")
+                return
+            db.execute("UPDATE players SET credits = credits - ? WHERE guild_id=? AND user_id=?", (SPIN10_COST, gid, uid))
+            spins = [apply_lucky_prize(gid, uid, owned) for _ in range(10)]
+            db.commit()
+            after = get_wallet(gid, uid)[0]
+            bonus = db.execute("SELECT bonus_spins FROM players WHERE guild_id=? AND user_id=?", (gid, uid)).fetchone()[0]
+        await self.show(interaction, notice="🎡 十連轉轉緊，結果請看頻道！")
+
+        keys = [k for k, _, _ in spins]
+        best = min(keys, key=PRIZE_RANK.index)
+        label_of = {p[0]: p[1] for p in PRIZES}
+        counts = "、".join(f"{label_of[k]} ×{keys.count(k)}" for k in PRIZE_RANK if k in keys)
+        net = after - credits
+        extra_spins = sum({"again": 1, "again2": 2}.get(k, 0) for k in keys)
+        big = [r for k, r, _ in spins if k in ("jackpot", "rainbow")]
+        cards = [c for _, _, c in spins if c]
+        who = interaction.user.mention
+        start = f"🎡 {who} 十連轉幸運轉盤（{SPIN10_COST} 金幣）"
+        msg = await interaction.followup.send(content=f"{start}……",
+                                              file=discord.File(io.BytesIO(await spin_gif_for(best)), filename="spin.gif"),
+                                              wait=True)
+        preview = asyncio.create_task(card_preview(cards[0])) if cards else None
+        await asyncio.sleep(2.6)
+        lines = [start, counts] + big + [
+            f"金幣：{'+' if net >= 0 else ''}{net}（剩餘 {after:,}）"
+            + (f"｜免費加轉 +{extra_spins}（共 {bonus} 次）" if extra_spins else "")]
+        await msg.edit(content="\n".join(lines))
         if preview:
             await attach_card(msg, preview)
 
