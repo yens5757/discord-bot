@@ -648,11 +648,9 @@ async def record_flex_game(match_id, data):
         await warn_double_links(gid, match_id, team, linked)
         if any(p["puuid"] not in linked for p in team):  # unlinked teammates wait for the owner
             game["number"] = number
-            held = db.execute("INSERT OR IGNORE INTO flex_reviews VALUES (?, ?, ?, ?, '{}', ?)",
-                              (match_id, gid, team_id, json.dumps(game, ensure_ascii=False), int(time.time()))).rowcount
-            db.commit()
-            if held:  # tell the owner once per game
-                await tell_owner_about_review(gid, match_id, game)
+            db.execute("INSERT OR IGNORE INTO flex_reviews VALUES (?, ?, ?, ?, '{}', ?)",
+                       (match_id, gid, team_id, json.dumps(game, ensure_ascii=False), int(time.time())))
+            db.commit()  # waits in /flexreview; no DM
 
 
 async def finish_flex_game(gid, match_id, game):
@@ -705,17 +703,6 @@ async def warn_double_links(gid, match_id, team, linked):
                              f"其中一個應該連結錯咗：佢只計咗一次，另一個玩家冇計分。用 /unlink 改返。")
         except discord.HTTPException as e:
             print(f"Couldn't DM the owner about double links in {match_id}: {e!r}")
-
-
-async def tell_owner_about_review(gid, match_id, game):
-    """Private message to the bot owner: this game has teammates nobody has linked."""
-    try:
-        owner = client.get_user(client.owner_id) or await client.fetch_user(client.owner_id)
-        embed = review_embed(gid, match_id, game, {})
-        await owner.send(content="有一場 Flex 有未連結的隊友（已連結成員已經計分），喺伺服器用 **/flexreview** 決定連結定略過。",
-                         embed=embed)
-    except discord.HTTPException as e:
-        print(f"Couldn't DM the owner about {match_id}: {e!r}")
 
 
 async def announce_flex(gid, number, match_id, info, members, won):
@@ -1353,7 +1340,7 @@ def champion_reel_png():
 
 
 SPIN10_COST = SPIN_COST * 10
-# best-looking prize first: its animation is shown for a 10-spin
+# best prize first: the order results are listed in for a 10-spin
 PRIZE_RANK = ["rainbow", "jackpot", "c100", "again2", "c50", "again", "c25", "c15", "c10", "net"]
 
 
@@ -1499,10 +1486,9 @@ class SpinView(MenuView):
             db.commit()
             after = get_wallet(gid, uid)[0]
             bonus = db.execute("SELECT bonus_spins FROM players WHERE guild_id=? AND user_id=?", (gid, uid)).fetchone()[0]
-        await self.show(interaction, notice="🎡 十連轉轉緊，結果請看頻道！")
+        await self.show(interaction, notice="🎡 十連轉完成，結果已發送到頻道！")
 
         keys = [k for k, _, _ in spins]
-        best = min(keys, key=PRIZE_RANK.index)
         label_of = {p[0]: p[1] for p in PRIZES}
         counts = "、".join(f"{label_of[k]} ×{keys.count(k)}" for k in PRIZE_RANK if k in keys)
         net = after - credits
@@ -1510,18 +1496,11 @@ class SpinView(MenuView):
         big = [r for k, r, _ in spins if k in ("jackpot", "rainbow")]
         cards = [c for _, _, c in spins if c]
         who = interaction.user.mention
-        start = f"🎡 {who} 十連轉幸運轉盤（{SPIN10_COST} 金幣）"
-        msg = await interaction.followup.send(content=f"{start}……",
-                                              file=discord.File(io.BytesIO(await spin_gif_for(best)), filename="spin.gif"),
-                                              wait=True)
-        preview = asyncio.create_task(card_preview(cards[0])) if cards else None
-        await asyncio.sleep(2.6)
-        lines = [start, counts] + big + [
+        lines = [f"🎡 {who} 十連轉幸運轉盤（{SPIN10_COST} 金幣）", counts] + big + [
             f"金幣：{'+' if net >= 0 else ''}{net}（剩餘 {after:,}）"
             + (f"｜免費加轉 +{extra_spins}（共 {bonus} 次）" if extra_spins else "")]
-        await msg.edit(content="\n".join(lines))
-        if preview:
-            await attach_card(msg, preview)
+        files = [discord.File(io.BytesIO(await card_preview(cards[0])), filename="card.png")] if cards else []
+        await interaction.followup.send(content="\n".join(lines), files=files)  # just the results, no animation
 
     async def champion_spin(self, interaction):
         gid, uid = interaction.guild_id, interaction.user.id
