@@ -92,7 +92,7 @@ if "champ_spins" not in player_cols:
     db.execute("ALTER TABLE players ADD COLUMN champ_spins INTEGER NOT NULL DEFAULT 0")
     db.execute("""UPDATE players SET champ_spins = (SELECT COUNT(*) FROM owned_styles o
         WHERE o.guild_id = players.guild_id AND o.user_id = players.user_id AND o.style LIKE 'champ:%')""")
-RIOT_TABLES = {  # a member can link up to MAX_RIOT_ACCOUNTS Riot accounts
+RIOT_TABLES = {  # a member can link any number of Riot accounts
     "riot_accounts": """(
     guild_id  INTEGER NOT NULL,
     user_id   INTEGER NOT NULL,
@@ -445,10 +445,9 @@ client.tree.add_command(result_group)
 # Every few minutes, check linked players' ranked Flex games. A game where 3+ linked members
 # of the same server were on the same team is recorded like /result flex and announced.
 
-FLEX_CHECK_SECONDS = 120  # ~12 accounts = ~12 requests per check; Riot allows 100 per 2 minutes
+FLEX_CHECK_SECONDS = 120  # at least; with many accounts it waits longer (see flex_check_interval)
 FLEX_LOOKBACK = 3 * 86400  # never look further back than this
 MIN_FLEX_MEMBERS = 3      # linked members needed on one team for a game to count
-MAX_RIOT_ACCOUNTS = 2     # Riot accounts one member can link
 
 
 def flex_channel(guild_id):
@@ -488,7 +487,7 @@ async def resolve_riot_id(session, riot_id):
     return acc["puuid"], f"{acc['gameName']}#{acc['tagLine']}", await riot.server(session, acc["puuid"])
 
 
-@client.tree.command(name="link", description=f"連結 Riot 帳號（自動記錄 Flex 積分場，每人最多 {MAX_RIOT_ACCOUNTS} 個）")
+@client.tree.command(name="link", description="連結 Riot 帳號（自動記錄 Flex 積分場，可以連結多個）")
 @app_commands.guild_only()
 @app_commands.describe(riot_id="Riot ID，例如 收網大師#TW2", user="要連結的玩家（預設自己；可以幫未連結的人連結）")
 async def link(interaction: discord.Interaction, riot_id: str, user: discord.Member = None):
@@ -508,11 +507,6 @@ async def link(interaction: discord.Interaction, riot_id: str, user: discord.Mem
     if taken:
         text = "已經連結咗呢個帳號。" if taken == user.id else f"**{riot_id}** 已經連結咗 <@{taken}>。"
         await interaction.response.send_message(text, ephemeral=True)
-        return
-    if len(current) >= MAX_RIOT_ACCOUNTS:
-        await interaction.response.send_message(
-            f"{user.mention} 已經連結咗 {MAX_RIOT_ACCOUNTS} 個帳號（{'、'.join(current)}），"
-            f"請先用 /unlink 取消一個。", ephemeral=True)
         return
 
     await interaction.response.defer(ephemeral=True)
@@ -765,6 +759,13 @@ async def refresh_accounts_if_key_changed(session):
     print("Riot key changed: linked accounts refreshed")
 
 
+def flex_check_interval():
+    """Each linked account costs one Riot request per check and Riot allows 100 per 2 minutes,
+    so allow 2 seconds per account (never less than FLEX_CHECK_SECONDS)."""
+    accounts = db.execute("SELECT count(DISTINCT puuid) FROM riot_accounts").fetchone()[0]
+    return max(FLEX_CHECK_SECONDS, 2 * accounts)
+
+
 async def watch_flex():
     await client.wait_until_ready()
     async with aiohttp.ClientSession() as session:
@@ -776,7 +777,7 @@ async def watch_flex():
                     await check_flex_games(session)
                 except Exception as e:  # e.g. an expired key: keep the bot running, try again later
                     print(f"Flex check failed: {e!r}")
-            await asyncio.sleep(FLEX_CHECK_SECONDS)
+            await asyncio.sleep(flex_check_interval())
 
 
 # ---------- Admin / owner commands ----------
@@ -1644,8 +1645,6 @@ class FlexReviewView(MenuView):
             _, _, game, _ = self.current
             owner = db.execute("SELECT user_id FROM riot_accounts WHERE guild_id=? AND puuid=?",
                                (gid, p["puuid"])).fetchone()
-            count = db.execute("SELECT count(*) FROM riot_accounts WHERE guild_id=? AND user_id=?",
-                               (gid, member.id)).fetchone()[0]
             linked = linked_puuids(gid)
             # one person can't be two players in the same game
             same_game = any(any(linked.get(q["puuid"]) == member.id for q in g["team"])
@@ -1657,8 +1656,6 @@ class FlexReviewView(MenuView):
             elif same_game:
                 await self.show(interaction, notice=f"{member.mention} 已經用另一個帳號同 {riot_name(p)} "
                                                     f"喺同一場打，{riot_name(p)} 唔可能係佢，請揀第二個人。")
-            elif count >= MAX_RIOT_ACCOUNTS:
-                await self.show(interaction, notice=f"{member.mention} 已經連結咗 {MAX_RIOT_ACCOUNTS} 個帳號。")
             else:
                 # every held game this account played in, not only the one on screen
                 games = [g for _, _, g, _ in self.load(gid) if any(q["puuid"] == p["puuid"] for q in g["team"])]
