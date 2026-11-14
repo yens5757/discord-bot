@@ -351,7 +351,7 @@ async def queue(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed)
 
 
-# ---------- /result 10mix and /result flex ----------
+# ---------- /result 10mix ----------
 
 result_group = app_commands.Group(name="result", description="回報比賽結果", guild_only=True)
 
@@ -398,52 +398,12 @@ async def result_mix(interaction: discord.Interaction, match_id: int, winner: ap
     await interaction.response.send_message(embed=embed)
 
 
-@result_group.command(name="flex", description="記錄 Flex 結果（5 人同隊）")
-@app_commands.describe(p1="玩家 1", p2="玩家 2", p3="玩家 3", p4="玩家 4", p5="玩家 5", outcome="輸定贏")
-@app_commands.choices(outcome=[
-    app_commands.Choice(name="贏", value="win"),
-    app_commands.Choice(name="輸", value="loss"),
-])
-async def result_flex(interaction: discord.Interaction,
-               p1: discord.Member, p2: discord.Member, p3: discord.Member,
-               p4: discord.Member, p5: discord.Member,
-               outcome: app_commands.Choice[str]):
-    team = [p1, p2, p3, p4, p5]
-    ids = [p.id for p in team]
-    if len(set(ids)) != len(ids):
-        await interaction.response.send_message("同一個人被選了兩次。", ephemeral=True)
-        return
-    if any(p.bot for p in team):
-        await interaction.response.send_message("不能把 bot 加入隊伍。", ephemeral=True)
-        return
-
-    gid = interaction.guild_id
-    won = outcome.value == "win"
-    record(gid, ids, won=won)
-    cur = db.execute(
-        "INSERT INTO matches (guild_id, team_a, team_b, status, winner, mode) "
-        "VALUES (?, ?, '', 'done', ?, 'flex')",
-        (gid, ids_to_str(ids), outcome.value),
-    )
-    db.commit()
-
-    sign = f"+{ELO_CHANGE}" if won else f"-{ELO_CHANGE}"
-    lines = [f"<@{u}> {sign} → **{get_player(gid, u)[0]}**" for u in ids]
-    embed = discord.Embed(
-        title=f"🏆 Flex 第 {cur.lastrowid} 場：贏了！" if won else f"💀 Flex 第 {cur.lastrowid} 場：輸了",
-        description="\n".join(lines),
-        color=discord.Color.gold() if won else discord.Color.dark_grey(),
-    )
-    embed.set_footer(text=f"金幣：每人 +{CREDIT_WIN if won else CREDIT_LOSS}")
-    await interaction.response.send_message(embed=embed, ephemeral=True)  # only the reporter sees it
-
-
 client.tree.add_command(result_group)
 
 
 # ---------- Riot: ranked Flex games recorded automatically ----------
 # Every few minutes, check linked players' ranked Flex games. A game where 3+ linked members
-# of the same server were on the same team is recorded like /result flex and announced.
+# of the same server were on the same team is recorded and announced.
 
 FLEX_CHECK_SECONDS = 120  # at least; with many accounts it waits longer (see flex_check_interval)
 FLEX_LOOKBACK = 3 * 86400  # never look further back than this
