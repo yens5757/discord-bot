@@ -239,6 +239,7 @@ class Bot(discord.Client):
         run_in_background(fill_spin_library())
         run_in_background(prepare_shop())
         run_in_background(watch_flex())
+        run_in_background(send_missing_review_dms())
         self.add_view(QueuePanel())
         self.add_view(MatchPanel())
         self.add_view(MixResultDM())
@@ -986,6 +987,23 @@ async def post_review_card(gid, match_id, team_id):
     db.execute("UPDATE flex_reviews SET channel_id=?, message_id=?, owner_msg_id=? WHERE match_id=? AND guild_id=? AND team_id=?",
                (channel.id if msg else None, msg.id if msg else None, dm.id if dm else None, match_id, gid, team_id))
     db.commit()
+
+
+async def send_missing_review_dms():
+    """Held games from before the DM panels get the owner's private panel (no public card, so a
+    backlog doesn't flood the channel)."""
+    await client.wait_until_ready()
+    for match_id, gid, team_id in db.execute("SELECT match_id, guild_id, team_id FROM flex_reviews "
+                                             "WHERE owner_msg_id IS NULL ORDER BY created_at").fetchall():
+        game, decisions = load_review(gid, match_id, team_id)
+        dm = await dm_owner(content="📋 Flex 有未連結嘅隊友（之前保留咗）：揀佢係邊個，或者略過",
+                            embed=review_embed(gid, match_id, game, decisions),
+                            view=await review_dm_view(gid, game, decisions))
+        if dm is None:
+            return  # DMs closed: try again next start
+        db.execute("UPDATE flex_reviews SET owner_msg_id=? WHERE match_id=? AND guild_id=? AND team_id=?",
+                   (dm.id, match_id, gid, team_id))
+        db.commit()
 
 
 async def add_to_game(gid, member_id, p, game):
