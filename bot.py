@@ -136,6 +136,10 @@ CREATE TABLE IF NOT EXISTS mix_queue (       -- the 10mix queue (kept here so a 
 )""")
 if "message_id" not in [row[1] for row in db.execute("PRAGMA table_info(matches)")]:
     db.execute("ALTER TABLE matches ADD COLUMN message_id INTEGER")  # 10mix: the public match card
+for table, column in (("matches", "channel_id"), ("matches", "owner_msg_id"),  # owner_msg_id: the owner's DM panel
+                      ("flex_reviews", "channel_id"), ("flex_reviews", "message_id"), ("flex_reviews", "owner_msg_id")):
+    if column not in [row[1] for row in db.execute(f"PRAGMA table_info({table})")]:
+        db.execute(f"ALTER TABLE {table} ADD COLUMN {column} INTEGER")
 db.execute("CREATE TABLE IF NOT EXISTS riot_matches (match_id TEXT PRIMARY KEY, checked_at INTEGER NOT NULL)")
 db.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
 if db.execute("SELECT 1 FROM meta WHERE key='start_credits_given'").fetchone() is None:
@@ -237,6 +241,7 @@ class Bot(discord.Client):
         run_in_background(watch_flex())
         self.add_view(QueuePanel())
         self.add_view(MatchPanel())
+        self.add_view(MixResultDM())
 
 
 client = Bot()
@@ -250,10 +255,157 @@ async def on_ready():
 
 @client.event
 async def on_message(message):
+    if message.guild and has_sticky(message.channel.id):
+        # our own panel reposts don't count, anything else pushes the panels back down
+        if not (message.author.id == client.user.id and message.channel.id in sticky_busy):
+            poke_sticky(message.channel)
     if message.author.bot:
         return
     if any(t in message.content for t in TRIGGERS):
         await message.reply(REPLY)
+
+
+@client.event
+async def on_interaction(interaction):
+    # private-message panels for Flex reviews (their buttons are matched by custom id, so they survive restarts)
+    if interaction.type == discord.InteractionType.component:
+        custom_id = interaction.data.get("custom_id", "")
+        if custom_id.startswith("revdm:"):
+            await handle_review_dm(interaction, custom_id)
+
+
+# ---------- Sticky panels: live panels stay the newest messages in their channel ----------
+# When someone posts in a channel with a live panel (queue panel, ongoing match card, Flex review card),
+# the panel is deleted and posted again at the bottom, a couple of seconds after the chat goes quiet.
+
+STICKY_DELAY = 2.0
+sticky_due = {}       # channel id -> when to repost
+sticky_workers = {}   # channel id -> task waiting to repost
+sticky_busy = set()   # channels being reposted right now (their own posts are ignored)
+
+
+def sticky_items(channel_id):
+    """[(kind, key, message id)] for the live panels in this channel, in the order they sit at the bottom."""
+    items = [("review", (m, g, t), msg) for m, g, t, msg in db.execute(
+        "SELECT match_id, guild_id, team_id, message_id FROM flex_reviews WHERE channel_id=? ORDER BY created_at",
+        (channel_id,))]
+    items += [("match", mid, msg) for mid, msg in db.execute(
+        "SELECT id, message_id FROM matches WHERE channel_id=? AND mode='mix' AND status='open' ORDER BY id",
+        (channel_id,))]
+    for key, value in db.execute("SELECT key, value FROM meta WHERE key LIKE 'queue_panel:%'"):
+        ch, msg = (int(x) for x in value.split(":"))
+        if ch == channel_id:
+            items.append(("queue", int(key.split(":")[1]), msg))
+    return items
+
+
+def has_sticky(channel_id):
+    return bool(sticky_items(channel_id))
+
+
+def sticky_render(kind, key):
+    """(embed, view) for a panel."""
+    if kind == "queue":
+        return queue_embed(key), QueuePanel()
+    if kind == "match":
+        gid, owner_msg = db.execute("SELECT guild_id, owner_msg_id FROM matches WHERE id=?", (key,)).fetchone()
+        return match_embed(gid, key), (MatchPanel() if owner_msg is None else None)  # 🔒 only if the DM failed
+    match_id, gid, team_id = key
+    game, decisions = load_review(gid, match_id, team_id)
+    return review_embed(gid, match_id, game, decisions), None
+
+
+def sticky_save(kind, key, channel_id, message_id):
+    if kind == "queue":
+        db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", (f"queue_panel:{key}", f"{channel_id}:{message_id}"))
+    elif kind == "match":
+        db.execute("UPDATE matches SET message_id=? WHERE id=?", (message_id, key))
+    else:
+        db.execute("UPDATE flex_reviews SET message_id=? WHERE match_id=? AND guild_id=? AND team_id=?", (message_id, *key))
+    db.commit()
+
+
+def poke_sticky(channel):
+    sticky_due[channel.id] = time.monotonic() + STICKY_DELAY
+    if channel.id not in sticky_workers:
+        sticky_workers[channel.id] = asyncio.create_task(sticky_worker(channel))
+
+
+async def sticky_worker(channel):
+    try:
+        while True:
+            wait = sticky_due[channel.id] - time.monotonic()
+            if wait > 0:
+                await asyncio.sleep(wait)
+                continue
+            due = sticky_due[channel.id]
+            await restick(channel)
+            if sticky_due[channel.id] == due:  # nothing new was posted meanwhile
+                break
+    except Exception as e:
+        print(f"Couldn't move panels down in {channel.id}: {e!r}")
+    finally:
+        sticky_workers.pop(channel.id, None)
+
+
+async def restick(channel):
+    items = sticky_items(channel.id)
+    if not items:
+        return
+    ours = {msg for _, _, msg in items}
+    try:
+        newest = [m.id async for m in channel.history(limit=len(items))]
+    except discord.HTTPException:
+        newest = []
+    keep = 0  # panels that are already the newest messages stay where they are
+    while keep < len(newest) and newest[keep] in ours:
+        keep += 1
+    staying = set(newest[:keep])
+    sticky_busy.add(channel.id)
+    try:
+        for kind, key, old in items:
+            if old in staying:
+                continue
+            embed, view = sticky_render(kind, key)
+            msg = await channel.send(embed=embed, view=view, allowed_mentions=discord.AllowedMentions.none())
+            sticky_save(kind, key, channel.id, msg.id)
+            if old:
+                try:
+                    await channel.get_partial_message(old).delete()
+                except discord.HTTPException:
+                    pass
+    finally:
+        sticky_busy.discard(channel.id)
+
+
+async def dm_owner(**kwargs):
+    """Private message to the bot owner. Returns the message, or None if it couldn't be sent."""
+    try:
+        owner = client.get_user(client.owner_id) or await client.fetch_user(client.owner_id)
+        return await owner.send(**kwargs)
+    except discord.HTTPException as e:
+        print(f"Couldn't DM the owner: {e!r}")
+        return None
+
+
+async def edit_owner_dm(message_id, **kwargs):
+    try:
+        owner = client.get_user(client.owner_id) or await client.fetch_user(client.owner_id)
+        channel = owner.dm_channel or await owner.create_dm()
+        await channel.get_partial_message(message_id).edit(**kwargs)
+    except discord.HTTPException as e:
+        print(f"Couldn't update the owner's DM {message_id}: {e!r}")
+
+
+async def edit_card(channel_id, message_id, embed):
+    """Turn a public card into its final state (no buttons). If it's gone, post the result instead."""
+    channel = client.get_channel(channel_id or 0)
+    if channel is None:
+        return
+    try:
+        await channel.get_partial_message(message_id).edit(embed=embed, view=None)
+    except discord.HTTPException:
+        await channel.send(embed=embed)
 
 
 # ---------- 10mix queue: a button panel ----------
@@ -334,11 +486,45 @@ def match_embed(gid, match_id):
 
 
 async def post_match_panel(channel, gid, match_id):
+    """Public match card (no buttons) + the owner's private result panel by DM."""
     a, b = db.execute("SELECT team_a, team_b FROM matches WHERE id=?", (match_id,)).fetchone()
-    msg = await channel.send(content=" ".join(f"<@{u}>" for u in str_to_ids(a) + str_to_ids(b)),
-                             embed=match_embed(gid, match_id), view=MatchPanel())
-    db.execute("UPDATE matches SET message_id=? WHERE id=?", (msg.id, match_id))
+    embed = match_embed(gid, match_id)
+    dm = await dm_owner(content=f"📝 10mix 第 {match_id} 場：完場後揀邊隊贏", embed=embed, view=MixResultDM())
+    msg = await channel.send(content=" ".join(f"<@{u}>" for u in str_to_ids(a) + str_to_ids(b)), embed=embed,
+                             view=None if dm else MatchPanel())  # no DM possible: 🔒 button on the card instead
+    db.execute("UPDATE matches SET channel_id=?, message_id=?, owner_msg_id=? WHERE id=?",
+               (channel.id, msg.id, dm.id if dm else None, match_id))
     db.commit()
+
+
+class MixResultDM(discord.ui.View):
+    """The owner's private 10mix panel (in DMs). Fixed custom ids; the match is found from the DM message."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+        for label, style, side in (("🔵 A 隊贏", discord.ButtonStyle.primary, "A"),
+                                   ("🔴 B 隊贏", discord.ButtonStyle.danger, "B"),
+                                   ("❌ 取消", discord.ButtonStyle.secondary, None)):
+            button = discord.ui.Button(label=label, style=style, custom_id=f"mixdm:{side or 'cancel'}")
+            button.callback = self.choose(side)
+            self.add_item(button)
+
+    def choose(self, side):
+        async def callback(interaction: discord.Interaction):
+            if interaction.user.id != client.owner_id:
+                await interaction.response.send_message("只有 bot 擁有者可以記錄結果。", ephemeral=True)
+                return
+            row = db.execute("SELECT id, guild_id, channel_id, message_id FROM matches WHERE owner_msg_id=?",
+                             (interaction.message.id,)).fetchone()
+            embed = finish_mix(row[1], row[0], side) if row else None
+            if embed is None:
+                await interaction.response.edit_message(content="呢場已經記錄或者取消咗。", view=None)
+                return
+            match_id, _, channel_id, message_id = row
+            done = "已取消" if side is None else f"{side} 隊贏，已記錄"
+            await interaction.response.edit_message(content=f"✅ 10mix 第 {match_id} 場：{done}。", embed=embed, view=None)
+            await edit_card(channel_id, message_id, embed)
+        return callback
 
 
 def finish_mix(gid, match_id, side):
@@ -466,7 +652,20 @@ async def queuepanel(interaction: discord.Interaction):
     if interaction.user.id != client.owner_id:
         await interaction.response.send_message("只有 bot 擁有者可以使用這個指令。", ephemeral=True)
         return
-    await interaction.response.send_message(embed=queue_embed(interaction.guild_id), view=QueuePanel())
+    gid = interaction.guild_id
+    old = db.execute("SELECT value FROM meta WHERE key=?", (f"queue_panel:{gid}",)).fetchone()
+    await interaction.response.send_message(embed=queue_embed(gid), view=QueuePanel())
+    msg = await interaction.original_response()
+    db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", (f"queue_panel:{gid}", f"{interaction.channel_id}:{msg.id}"))
+    db.commit()
+    if old:  # remove the previous panel
+        channel_id, message_id = (int(x) for x in old[0].split(":"))
+        channel = client.get_channel(channel_id)
+        if channel:
+            try:
+                await channel.get_partial_message(message_id).delete()
+            except discord.HTTPException:
+                pass
 
 
 # ---------- Riot: ranked Flex games recorded automatically ----------
@@ -648,7 +847,7 @@ def team_members(gid, game):
 
 async def record_flex_game(match_id, data):
     """A finished ranked Flex game: for every server with 3+ linked members on one team, record it for
-    them; teammates nobody has linked are kept for the owner to link or skip (/flexreview)."""
+    them; teammates nobody has linked get a public card and the owner a private panel to link or skip them."""
     info = data["info"]
     started = info["gameStartTimestamp"] // 1000
     if info.get("gameDuration", 0) < 300:  # remake
@@ -670,9 +869,12 @@ async def record_flex_game(match_id, data):
         await warn_double_links(gid, match_id, team, linked)
         if any(p["puuid"] not in linked for p in team):  # unlinked teammates wait for the owner
             game["number"] = number
-            db.execute("INSERT OR IGNORE INTO flex_reviews VALUES (?, ?, ?, ?, '{}', ?)",
-                       (match_id, gid, team_id, json.dumps(game, ensure_ascii=False), int(time.time())))
-            db.commit()  # waits in /flexreview; no DM
+            held = db.execute("INSERT OR IGNORE INTO flex_reviews (match_id, guild_id, team_id, game, created_at) "
+                              "VALUES (?, ?, ?, ?, ?)",
+                              (match_id, gid, team_id, json.dumps(game, ensure_ascii=False), int(time.time()))).rowcount
+            db.commit()
+            if held:
+                await post_review_card(gid, match_id, team_id)
 
 
 async def finish_flex_game(gid, match_id, game):
@@ -708,6 +910,194 @@ def review_embed(gid, match_id, game, decisions):
         description="\n".join(lines) + "\n\n✅ 已連結成員已經計分　❓ 未連結的隊友：連結到成員（會補計呢場）或者略過",
         color=discord.Color.blurple(),
     ).set_footer(text=match_id)
+
+
+def load_review(gid, match_id, team_id):
+    game, decisions = db.execute("SELECT game, decisions FROM flex_reviews WHERE match_id=? AND guild_id=? AND team_id=?",
+                                 (match_id, gid, team_id)).fetchone()
+    return json.loads(game), json.loads(decisions)
+
+
+def open_reviews(gid):
+    rows = db.execute("SELECT match_id, team_id, game, decisions, channel_id, message_id, owner_msg_id FROM flex_reviews "
+                      "WHERE guild_id=? ORDER BY created_at", (gid,)).fetchall()
+    return [(m, t, json.loads(g), json.loads(d), ch, msg, dm) for m, t, g, d, ch, msg, dm in rows]
+
+
+def undecided(gid, game, decisions):
+    linked = linked_puuids(gid)
+    return [p for p in game["team"] if p["puuid"] not in linked and p["puuid"] not in decisions]
+
+
+name_cache = {}
+
+
+async def player_options(gid):
+    """Up to 25 server players (most games first) to choose from in the owner's DM."""
+    options = []
+    for (uid,) in db.execute("SELECT user_id FROM players WHERE guild_id=? ORDER BY wins + losses DESC, user_id LIMIT 25",
+                             (gid,)).fetchall():
+        if uid not in name_cache:
+            try:
+                user = client.get_user(uid) or await client.fetch_user(uid)
+                name_cache[uid] = user.display_name
+            except discord.HTTPException:
+                name_cache[uid] = str(uid)
+        options.append(discord.SelectOption(label=name_cache[uid][:100], value=str(uid)))
+    return options
+
+
+async def review_dm_view(gid, game, decisions):
+    """The owner's private panel for one Flex review. Custom ids carry the Riot account, so they survive restarts."""
+    view = discord.ui.View(timeout=None)
+    waiting = undecided(gid, game, decisions)[:4]
+    options = await player_options(gid)
+    for row, p in enumerate(waiting):
+        if options:
+            view.add_item(discord.ui.Select(custom_id=f"revdm:pick:{p['puuid']}", placeholder=f"{riot_name(p)} 係邊個？",
+                                            options=options, row=row))
+        view.add_item(discord.ui.Button(label=f"略過 {riot_name(p)}"[:80], custom_id=f"revdm:skip:{p['puuid']}", row=4))
+    view.add_item(discord.ui.Button(label="✅ 完成（略過其餘）", custom_id="revdm:done",
+                                    style=discord.ButtonStyle.success, row=4))
+    return view
+
+
+def review_done_embed(gid, match_id, game, decisions):
+    embed = review_embed(gid, match_id, game, decisions)
+    embed.title = embed.title.replace("📋", "✅", 1) + "（已處理）"
+    embed.description = embed.description.split("\n\n")[0]
+    embed.color = discord.Color.green()
+    return embed
+
+
+async def post_review_card(gid, match_id, team_id):
+    """Public card in the Flex channel (no buttons) + the owner's private panel by DM."""
+    game, decisions = load_review(gid, match_id, team_id)
+    embed = review_embed(gid, match_id, game, decisions)
+    channel = client.get_channel(flex_channel(gid) or 0)
+    msg = None
+    if channel:
+        try:
+            msg = await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+        except discord.HTTPException as e:
+            print(f"Couldn't post the Flex review card for {match_id}: {e!r}")
+    dm = await dm_owner(content="📋 Flex 有未連結嘅隊友：揀佢係邊個，或者略過", embed=embed,
+                        view=await review_dm_view(gid, game, decisions))
+    db.execute("UPDATE flex_reviews SET channel_id=?, message_id=?, owner_msg_id=? WHERE match_id=? AND guild_id=? AND team_id=?",
+               (channel.id if msg else None, msg.id if msg else None, dm.id if dm else None, match_id, gid, team_id))
+    db.commit()
+
+
+async def add_to_game(gid, member_id, p, game):
+    """A teammate linked after the game was recorded gets its result too."""
+    number = game.get("number")
+    row = db.execute("SELECT team_a FROM matches WHERE id=? AND guild_id=?", (number, gid)).fetchone()
+    if row is None:
+        return "（搵唔到嗰場記錄，冇補計）"
+    ids = str_to_ids(row[0])
+    if member_id in ids:
+        return "（佢已經喺呢場入面，冇重複計）"
+    won = game["won"]
+    record(gid, [member_id], won=won)
+    db.execute("UPDATE matches SET team_a=? WHERE id=?", (ids_to_str(ids + [member_id]), number))
+    db.commit()
+    sign = f"+{ELO_CHANGE}" if won else f"-{ELO_CHANGE}"
+    text = (f"<@{member_id}>（{riot_name(p)}）補計 Flex 第 {number} 場：{'贏了' if won else '輸了'}　"
+            f"{sign} → **{get_player(gid, member_id)[0]}**")
+    channel = client.get_channel(flex_channel(gid) or 0)
+    if channel:
+        try:
+            await channel.send(f"🔗 {text}")
+        except discord.HTTPException as e:
+            print(f"Couldn't announce late link: {e!r}")
+    return text
+
+
+async def link_unknown(gid, puuid, member_id):
+    """Link a held teammate's Riot account to a member and give them every held game they played."""
+    reviews = [r for r in open_reviews(gid) if any(q["puuid"] == puuid for q in r[2]["team"])]
+    if not reviews:
+        return "搵唔到呢個帳號。"
+    p = next(q for q in reviews[0][2]["team"] if q["puuid"] == puuid)
+    owner = db.execute("SELECT user_id FROM riot_accounts WHERE guild_id=? AND puuid=?", (gid, puuid)).fetchone()
+    if owner:
+        return f"{riot_name(p)} 已經連結咗 <@{owner[0]}>。"
+    linked = linked_puuids(gid)
+    if any(any(linked.get(q["puuid"]) == member_id for q in r[2]["team"]) for r in reviews):
+        return f"<@{member_id}> 已經用另一個帳號同 {riot_name(p)} 喺同一場打，{riot_name(p)} 唔可能係佢，請揀第二個人。"
+    get_player(gid, member_id)
+    db.execute("INSERT INTO riot_accounts VALUES (?, ?, ?, ?, ?, ?)",
+               (gid, member_id, puuid, riot_name(p), reviews[0][2]["server"], min(r[2]["start"] for r in reviews)))
+    db.commit()
+    added = []
+    for r in reviews:
+        q = next(q for q in r[2]["team"] if q["puuid"] == puuid)
+        added.append(await add_to_game(gid, member_id, q, r[2]))
+    return f"🔗 {riot_name(p)} 已連結到 <@{member_id}>（之後嘅 Flex 都會計）\n補計 {len(added)} 場：\n" + "\n".join(added)
+
+
+async def sync_reviews(gid, current_dm=None):
+    """After a decision: close finished reviews (cards turn green, DMs lose their buttons) and refresh
+    the rest. The DM being clicked (current_dm) is left for the caller to update."""
+    linked = linked_puuids(gid)
+    for match_id, team_id, game, decisions, channel_id, message_id, dm_id in open_reviews(gid):
+        finished = all(q["puuid"] in linked or q["puuid"] in decisions for q in game["team"])
+        if finished:
+            db.execute("DELETE FROM flex_reviews WHERE match_id=? AND guild_id=? AND team_id=?", (match_id, gid, team_id))
+            db.commit()
+            done = review_done_embed(gid, match_id, game, decisions)
+            if message_id:
+                await edit_card(channel_id, message_id, done)
+            if dm_id and dm_id != current_dm:
+                await edit_owner_dm(dm_id, content="✅ 已處理", embed=done, view=None)
+        else:
+            embed = review_embed(gid, match_id, game, decisions)
+            if message_id:
+                channel = client.get_channel(channel_id or 0)
+                if channel:
+                    try:
+                        await channel.get_partial_message(message_id).edit(embed=embed)
+                    except discord.HTTPException:
+                        pass
+            if dm_id and dm_id != current_dm:
+                await edit_owner_dm(dm_id, embed=embed, view=await review_dm_view(gid, game, decisions))
+
+
+async def handle_review_dm(interaction, custom_id):
+    if interaction.user.id != client.owner_id:
+        await interaction.response.send_message("只有 bot 擁有者可以用。", ephemeral=True)
+        return
+    row = db.execute("SELECT match_id, guild_id, team_id FROM flex_reviews WHERE owner_msg_id=?",
+                     (interaction.message.id,)).fetchone()
+    if row is None:
+        await interaction.response.edit_message(content="✅ 呢場已經處理完。", view=None)
+        return
+    match_id, gid, team_id = row
+    await interaction.response.defer()  # linking can add several games: more than Discord's 3 seconds
+    _, action, puuid = (custom_id.split(":", 2) + [""])[:3]
+    game, decisions = load_review(gid, match_id, team_id)
+    if action == "pick":
+        notice = await link_unknown(gid, puuid, int(interaction.data["values"][0]))
+    elif action == "skip":
+        decisions[puuid] = "ignore"
+        notice = "⏭️ 已略過 " + next((riot_name(p) for p in game["team"] if p["puuid"] == puuid), "?")
+    else:  # done: skip everyone left
+        for p in undecided(gid, game, decisions):
+            decisions[p["puuid"]] = "ignore"
+        notice = "⏭️ 已略過其餘隊友"
+    db.execute("UPDATE flex_reviews SET decisions=? WHERE match_id=? AND guild_id=? AND team_id=?",
+               (json.dumps(decisions), match_id, gid, team_id))
+    db.commit()
+    await sync_reviews(gid, current_dm=interaction.message.id)
+    still_open = db.execute("SELECT 1 FROM flex_reviews WHERE match_id=? AND guild_id=? AND team_id=?",
+                            (match_id, gid, team_id)).fetchone()
+    game, decisions = (load_review(gid, match_id, team_id) if still_open else (game, decisions))
+    if still_open:
+        await interaction.edit_original_response(content=notice, embed=review_embed(gid, match_id, game, decisions),
+                                                 view=await review_dm_view(gid, game, decisions))
+    else:
+        await interaction.edit_original_response(content=f"{notice}\n✅ 呢場處理完。",
+                                                 embed=review_done_embed(gid, match_id, game, decisions), view=None)
 
 
 async def warn_double_links(gid, match_id, team, linked):
@@ -1570,174 +1960,6 @@ class SpinView(MenuView):
 @app_commands.guild_only()
 async def spin(interaction: discord.Interaction):
     await SpinView(interaction).open(interaction)
-
-
-# ---------- Flex review (games with unlinked teammates) ----------
-
-class FlexReviewView(MenuView):
-    """/flexreview: recorded Flex games that had teammates nobody has linked. Link each one to a member
-    (they get that game's result too) or skip them; once everyone is decided the game leaves the list."""
-
-    def __init__(self, interaction):
-        super().__init__(interaction)
-        self.index = 0
-
-    def load(self, gid):
-        rows = db.execute("SELECT match_id, team_id, game, decisions FROM flex_reviews WHERE guild_id=? "
-                          "ORDER BY created_at", (gid,)).fetchall()
-        return [(m, t, json.loads(g), json.loads(d)) for m, t, g, d in rows]
-
-    def build(self, gid, uid, notice=None):
-        self.clear_items()
-        reviews = self.load(gid)
-        if not reviews:
-            embed = discord.Embed(title="📋 Flex 待確認", description="冇待確認的 Flex 場。", color=discord.Color.blurple())
-        else:
-            self.index = min(self.index, len(reviews) - 1)
-            match_id, team_id, game, decisions = reviews[self.index]
-            self.current = (match_id, team_id, game, decisions)
-            embed = review_embed(gid, match_id, game, decisions)
-            embed.title += f"（{self.index + 1}/{len(reviews)}）"
-            linked = linked_puuids(gid)
-            open_ = [p for p in game["team"] if p["puuid"] not in linked and p["puuid"] not in decisions][:3]
-            for row, p in enumerate(open_):
-                select = discord.ui.UserSelect(placeholder=f"將 {riot_name(p)} 連結到…", row=row)
-                select.callback = self.link_to(p, select)
-                self.add_item(select)
-                self.button(f"略過 {riot_name(p)}"[:80], self.skip(p), row=3)
-            self.button("✅ 完成（略過其餘）", self.finish, discord.ButtonStyle.success, row=4)
-            if len(reviews) > 1:
-                self.button("◀", self.turn(-1), disabled=self.index == 0, row=4)
-                self.button("▶", self.turn(1), disabled=self.index >= len(reviews) - 1, row=4)
-        if notice:
-            embed.description = f"{notice}\n\n{embed.description}"
-        return embed
-
-    def turn(self, step):
-        async def callback(interaction):
-            self.index += step
-            await self.show(interaction)
-        return callback
-
-    def save(self, decisions):
-        match_id, team_id, _, _ = self.current
-        db.execute("UPDATE flex_reviews SET decisions=? WHERE match_id=? AND guild_id=? AND team_id=?",
-                   (json.dumps(decisions), match_id, self.interaction.guild_id, team_id))
-        db.commit()
-
-    def close(self, gid):
-        match_id, team_id, _, _ = self.current
-        db.execute("DELETE FROM flex_reviews WHERE match_id=? AND guild_id=? AND team_id=?", (match_id, gid, team_id))
-        db.commit()
-
-    async def decided(self, interaction, notice):
-        """After a decision: once every unlinked teammate is decided, the game leaves the list."""
-        self.interaction = interaction
-        gid = interaction.guild_id
-        _, _, game, decisions = self.current
-        linked = linked_puuids(gid)
-        if all(p["puuid"] in linked or p["puuid"] in decisions for p in game["team"]):
-            self.close(gid)
-            notice += "\n✅ 呢場全部處理完。"
-        await self.show(interaction, notice=notice)
-
-    async def add_to_game(self, gid, member, p, game):
-        """A teammate linked after the game was recorded gets its result too."""
-        number = game.get("number")
-        row = db.execute("SELECT team_a FROM matches WHERE id=? AND guild_id=?", (number, gid)).fetchone()
-        if row is None:
-            return "（搵唔到嗰場記錄，冇補計）"
-        ids = str_to_ids(row[0])
-        if member.id in ids:
-            return "（佢已經喺呢場入面，冇重複計）"
-        won = game["won"]
-        record(gid, [member.id], won=won)
-        db.execute("UPDATE matches SET team_a=? WHERE id=?", (ids_to_str(ids + [member.id]), number))
-        db.commit()
-        sign = f"+{ELO_CHANGE}" if won else f"-{ELO_CHANGE}"
-        text = (f"{member.mention}（{riot_name(p)}）補計 Flex 第 {number} 場：{'贏了' if won else '輸了'}　"
-                f"{sign} → **{get_player(gid, member.id)[0]}**")
-        channel = client.get_channel(flex_channel(gid) or 0)
-        if channel:
-            try:
-                await channel.send(f"🔗 {text}")
-            except discord.HTTPException as e:
-                print(f"Couldn't announce late link: {e!r}")
-        return text
-
-    def link_to(self, p, select):
-        async def callback(interaction):
-            await interaction.response.defer()  # adding several games can take longer than Discord's 3 seconds
-            gid = interaction.guild_id
-            member = select.values[0]
-            _, _, game, _ = self.current
-            owner = db.execute("SELECT user_id FROM riot_accounts WHERE guild_id=? AND puuid=?",
-                               (gid, p["puuid"])).fetchone()
-            linked = linked_puuids(gid)
-            # one person can't be two players in the same game
-            same_game = any(any(linked.get(q["puuid"]) == member.id for q in g["team"])
-                            for _, _, g, _ in self.load(gid) if any(q["puuid"] == p["puuid"] for q in g["team"]))
-            if member.bot:
-                await self.show(interaction, notice="不能連結 bot。")
-            elif owner:
-                await self.show(interaction, notice=f"{riot_name(p)} 已經連結咗 <@{owner[0]}>。")
-            elif same_game:
-                await self.show(interaction, notice=f"{member.mention} 已經用另一個帳號同 {riot_name(p)} "
-                                                    f"喺同一場打，{riot_name(p)} 唔可能係佢，請揀第二個人。")
-            else:
-                # every held game this account played in, not only the one on screen
-                games = [g for _, _, g, _ in self.load(gid) if any(q["puuid"] == p["puuid"] for q in g["team"])]
-                get_player(gid, member.id)
-                db.execute("INSERT INTO riot_accounts VALUES (?, ?, ?, ?, ?, ?)",
-                           (gid, member.id, p["puuid"], riot_name(p), game["server"],
-                            min([g["start"] for g in games] + [game["start"]])))
-                db.commit()
-                added = []
-                for g in games:
-                    q = next(q for q in g["team"] if q["puuid"] == p["puuid"])
-                    added.append(await self.add_to_game(gid, member, q, g))
-                done = self.close_finished(gid)
-                notice = (f"🔗 {riot_name(p)} 已連結到 {member.mention}（之後嘅 Flex 都會計）\n"
-                          f"補計 {len(added)} 場：\n" + "\n".join(added))
-                if done:
-                    notice += f"\n✅ {done} 場已經全部處理完。"
-                self.interaction = interaction
-                await self.show(interaction, notice=notice)
-        return callback
-
-    def close_finished(self, gid):
-        """Drop held games where every teammate is now linked or skipped. Returns how many."""
-        linked = linked_puuids(gid)
-        done = 0
-        for match_id, team_id, g, decisions in self.load(gid):
-            if all(q["puuid"] in linked or q["puuid"] in decisions for q in g["team"]):
-                db.execute("DELETE FROM flex_reviews WHERE match_id=? AND guild_id=? AND team_id=?",
-                           (match_id, gid, team_id))
-                done += 1
-        db.commit()
-        return done
-
-    def skip(self, p):
-        async def callback(interaction):
-            _, _, _, decisions = self.current
-            decisions[p["puuid"]] = "ignore"
-            self.save(decisions)
-            await self.decided(interaction, f"⏭️ 已略過 {riot_name(p)}")
-        return callback
-
-    async def finish(self, interaction):
-        self.interaction = interaction
-        self.close(interaction.guild_id)
-        await self.show(interaction, notice="⏭️ 已略過其餘隊友，呢場處理完。")
-
-
-@client.tree.command(name="flexreview", description="處理有未連結隊友的 Flex 場（只限 bot 擁有者）")
-@app_commands.guild_only()
-async def flexreview(interaction: discord.Interaction):
-    if interaction.user.id != client.owner_id:
-        await interaction.response.send_message("只有 bot 擁有者可以使用這個指令。", ephemeral=True)
-        return
-    await FlexReviewView(interaction).open(interaction)
 
 
 # ---------- Duo / line-up stats ----------
