@@ -33,7 +33,6 @@ load_dotenv()  # reads DISCORD_TOKEN from the .env file next to this script
 TRIGGERS = ["冠", "魔"]
 REPLY = "收網"
 
-MIX_SIZE = 10            # 10mix: 10 players split into 2 teams (set to 2 to test)
 START_ELO = 1000         # everyone's starting ELO
 ELO_CHANGE = 20          # Flex: win +20, loss -20 (both modes share the same ELO)
 START_CREDITS = 100      # credits every player starts with
@@ -128,6 +127,15 @@ CREATE TABLE IF NOT EXISTS flex_reviews (     -- Flex games held until the owner
     created_at INTEGER NOT NULL,
     PRIMARY KEY (match_id, guild_id, team_id)
 )""")
+db.execute("""
+CREATE TABLE IF NOT EXISTS mix_queue (       -- the 10mix queue (kept here so a restart doesn't lose it)
+    guild_id  INTEGER NOT NULL,
+    user_id   INTEGER NOT NULL,
+    joined_at REAL NOT NULL,
+    PRIMARY KEY (guild_id, user_id)
+)""")
+if "message_id" not in [row[1] for row in db.execute("PRAGMA table_info(matches)")]:
+    db.execute("ALTER TABLE matches ADD COLUMN message_id INTEGER")  # 10mix: the public match card
 db.execute("CREATE TABLE IF NOT EXISTS riot_matches (match_id TEXT PRIMARY KEY, checked_at INTEGER NOT NULL)")
 db.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
 if db.execute("SELECT 1 FROM meta WHERE key='start_credits_given'").fetchone() is None:
@@ -201,35 +209,10 @@ def open_match_of(guild_id, user_id):
     return None
 
 
-def avg(team):
-    return sum(elo for _, elo in team) / len(team)
-
-
-def balance_teams(players):
-    """players: list of (user_id, elo). Returns the split with the smallest ELO gap."""
-    players = players[:]
-    random.shuffle(players)  # so equal splits don't always come out the same
-    total = sum(elo for _, elo in players)
-    first, rest = players[0], players[1:]
-    best, best_gap = None, None
-    for combo in itertools.combinations(rest, len(players) // 2 - 1):
-        team_a = [first, *combo]
-        gap = abs(total - 2 * sum(elo for _, elo in team_a))
-        if best_gap is None or gap < best_gap:
-            best, best_gap = team_a, gap
-    a_ids = {u for u, _ in best}
-    team_b = [p for p in players if p[0] not in a_ids]
-    return best, team_b
-
-
 def mix_change(winner_avg, loser_avg):
     """ELO each 10mix winner gains (and each loser loses), based on the average gap."""
     expected = 1 / (1 + 10 ** ((loser_avg - winner_avg) / 400))
     return max(1, round(MIX_K * (1 - expected)))
-
-
-def team_text(team):
-    return "\n".join(f"<@{u}>（{elo}）" for u, elo in sorted(team, key=lambda p: -p[1]))
 
 
 # ---------- Bot ----------
@@ -252,11 +235,12 @@ class Bot(discord.Client):
         run_in_background(fill_spin_library())
         run_in_background(prepare_shop())
         run_in_background(watch_flex())
+        self.add_view(QueuePanel())
+        self.add_view(MatchPanel())
 
 
 client = Bot()
-queues = {}               # guild_id -> list of user_ids in the 10mix queue
-queue_lock = asyncio.Lock()
+queue_lock = asyncio.Lock()  # 10mix queue changes, one at a time
 
 
 @client.event
@@ -272,133 +256,217 @@ async def on_message(message):
         await message.reply(REPLY)
 
 
-# ---------- 10mix queue ----------
+# ---------- 10mix queue: a button panel ----------
+# 加入 / 離開 buttons on one message. At 10 players a game starts, teams balanced by total ELO.
 
-@client.tree.command(name="join", description="加入 10mix 排隊")
-@app_commands.guild_only()
-async def join(interaction: discord.Interaction):
-    gid, uid = interaction.guild_id, interaction.user.id
+TEAM_SIZE = 5
 
-    async with queue_lock:
-        q = queues.setdefault(gid, [])
-        if uid in q:
-            await interaction.response.send_message("你已經在排隊中。", ephemeral=True)
-            return
-        match_id = open_match_of(gid, uid)
-        if match_id:
-            await interaction.response.send_message(
-                f"你還在第 {match_id} 場比賽中，請先用 /result 10mix 回報結果。", ephemeral=True
-            )
-            return
 
-        q.append(uid)
-        if len(q) < MIX_SIZE:
-            await interaction.response.send_message(
-                f"{interaction.user.mention} 加入了排隊（{len(q)}/{MIX_SIZE}）"
-            )
-            return
+def queue_ids(gid):
+    """Players in the queue, in the order they joined."""
+    return [r[0] for r in db.execute("SELECT user_id FROM mix_queue WHERE guild_id=? ORDER BY joined_at", (gid,))]
 
-        # Queue is full: start a match
-        player_ids = q[:MIX_SIZE]
-        del q[:MIX_SIZE]
 
-    players = [(u, get_player(gid, u)[0]) for u in player_ids]
-    team_a, team_b = balance_teams(players)
+def queue_embed(gid):
+    ids = queue_ids(gid)
+    embed = discord.Embed(title=f"⚔️ 10mix 排隊（{len(ids)}/{TEAM_SIZE * 2}）",
+                          description="\n".join(f"{i}. <@{u}>" for i, u in enumerate(ids, 1)) or "未有人排隊",
+                          color=discord.Color.blurple())
+    embed.set_footer(text="撳「加入」排隊，夠 10 人自動開波，按 ELO 分成最平均嘅兩隊")
+    return embed
+
+
+def take_ten(gid):
+    """If 10 are queued, take them out of the queue and return their ids."""
+    ids = queue_ids(gid)[:TEAM_SIZE * 2]
+    if len(ids) < TEAM_SIZE * 2:
+        return None
+    db.executemany("DELETE FROM mix_queue WHERE guild_id=? AND user_id=?", [(gid, u) for u in ids])
+    db.commit()
+    return ids
+
+
+def balance_teams(players):
+    """players: [(user_id, elo)]. Returns the split with the smallest ELO gap."""
+    players = players[:]
+    random.shuffle(players)  # so equal splits don't always come out the same
+    total = sum(elo for _, elo in players)
+    first, rest = players[0], players[1:]
+    best, best_gap = None, None
+    for combo in itertools.combinations(rest, len(players) // 2 - 1):
+        team_a = [first, *combo]
+        gap = abs(total - 2 * sum(elo for _, elo in team_a))
+        if best_gap is None or gap < best_gap:
+            best, best_gap = team_a, gap
+    a_ids = {u for u, _ in best}
+    return best, [p for p in players if p[0] not in a_ids]
+
+
+def team_avg(team):
+    return sum(elo for _, elo in team) / len(team)
+
+
+def team_lines(team):
+    return "\n".join(f"<@{u}>（{elo}）" for u, elo in sorted(team, key=lambda p: -p[1]))
+
+
+async def start_mix_match(channel, gid, ids):
+    team_a, team_b = balance_teams([(u, get_player(gid, u)[0]) for u in ids])
     cur = db.execute(
         "INSERT INTO matches (guild_id, team_a, team_b, mode) VALUES (?, ?, ?, 'mix')",
         (gid, ids_to_str(u for u, _ in team_a), ids_to_str(u for u, _ in team_b)),
     )
     db.commit()
-    match_id = cur.lastrowid
-
-    a_win, b_win = mix_change(avg(team_a), avg(team_b)), mix_change(avg(team_b), avg(team_a))
-    embed = discord.Embed(
-        title=f"⚔️ 10mix 第 {match_id} 場開始！",
-        description=f"A 隊贏：±{a_win}｜B 隊贏：±{b_win}",
-        color=discord.Color.blurple(),
-    )
-    embed.add_field(name=f"🔵 A 隊（平均 {avg(team_a):.0f}）", value=team_text(team_a))
-    embed.add_field(name=f"🔴 B 隊（平均 {avg(team_b):.0f}）", value=team_text(team_b))
-    embed.set_footer(text=f"比賽結束後用 /result 10mix {match_id} 回報勝方")
-    await interaction.response.send_message(
-        content=" ".join(f"<@{u}>" for u in player_ids), embed=embed
-    )
+    await post_match_panel(channel, gid, cur.lastrowid)
 
 
-@client.tree.command(name="leave", description="離開 10mix 排隊")
-@app_commands.guild_only()
-async def leave(interaction: discord.Interaction):
-    async with queue_lock:
-        q = queues.setdefault(interaction.guild_id, [])
-        if interaction.user.id not in q:
-            await interaction.response.send_message("你不在排隊中。", ephemeral=True)
-            return
-        q.remove(interaction.user.id)
-        await interaction.response.send_message(
-            f"{interaction.user.mention} 離開了排隊（{len(q)}/{MIX_SIZE}）"
-        )
+def match_embed(gid, match_id):
+    """The public 'current match' card: both teams, average ELO and what each side would win."""
+    a, b = db.execute("SELECT team_a, team_b FROM matches WHERE id=?", (match_id,)).fetchone()
+    team_a = [(u, get_player(gid, u)[0]) for u in str_to_ids(a)]
+    team_b = [(u, get_player(gid, u)[0]) for u in str_to_ids(b)]
+    a_win, b_win = mix_change(team_avg(team_a), team_avg(team_b)), mix_change(team_avg(team_b), team_avg(team_a))
+    embed = discord.Embed(title=f"⚔️ 10mix 第 {match_id} 場（進行中）",
+                          description=f"A 隊贏：±{a_win}｜B 隊贏：±{b_win}", color=discord.Color.blurple())
+    embed.add_field(name=f"🔵 A 隊（平均 {team_avg(team_a):.0f}）", value=team_lines(team_a))
+    embed.add_field(name=f"🔴 B 隊（平均 {team_avg(team_b):.0f}）", value=team_lines(team_b))
+    return embed
 
 
-@client.tree.command(name="queue", description="查看 10mix 排隊名單")
-@app_commands.guild_only()
-async def queue(interaction: discord.Interaction):
-    q = queues.get(interaction.guild_id, [])
-    if not q:
-        await interaction.response.send_message("目前沒有人排隊。")
-        return
-    names = "\n".join(f"{i}. <@{u}>" for i, u in enumerate(q, 1))
-    embed = discord.Embed(title=f"10mix 排隊中（{len(q)}/{MIX_SIZE}）", description=names)
-    await interaction.response.send_message(embed=embed)
-
-
-# ---------- /result 10mix ----------
-
-result_group = app_commands.Group(name="result", description="回報比賽結果", guild_only=True)
-
-
-@result_group.command(name="10mix", description="回報 10mix 比賽結果")
-@app_commands.describe(match_id="比賽編號", winner="勝方")
-@app_commands.choices(winner=[
-    app_commands.Choice(name="A 隊", value="A"),
-    app_commands.Choice(name="B 隊", value="B"),
-])
-async def result_mix(interaction: discord.Interaction, match_id: int, winner: app_commands.Choice[str]):
-    gid = interaction.guild_id
-    row = db.execute(
-        "SELECT team_a, team_b, status FROM matches WHERE id=? AND guild_id=? AND mode='mix'",
-        (match_id, gid),
-    ).fetchone()
-    if row is None:
-        await interaction.response.send_message("找不到這場 10mix 比賽。", ephemeral=True)
-        return
-    a_str, b_str, status = row
-    if status != "open":
-        await interaction.response.send_message("這場比賽已經回報或取消了。", ephemeral=True)
-        return
-    a_ids, b_ids = str_to_ids(a_str), str_to_ids(b_str)
-    is_admin = interaction.user.guild_permissions.manage_guild
-    if interaction.user.id not in a_ids + b_ids and not is_admin:
-        await interaction.response.send_message("只有這場比賽的玩家或管理員可以回報。", ephemeral=True)
-        return
-
-    winners, losers = (a_ids, b_ids) if winner.value == "A" else (b_ids, a_ids)
-    win_avg = sum(get_player(gid, u)[0] for u in winners) / len(winners)
-    lose_avg = sum(get_player(gid, u)[0] for u in losers) / len(losers)
-    points = mix_change(win_avg, lose_avg)
-
-    record(gid, winners, won=True, change=points)
-    record(gid, losers, won=False, change=points)
-    db.execute("UPDATE matches SET status='done', winner=? WHERE id=?", (winner.value, match_id))
+async def post_match_panel(channel, gid, match_id):
+    a, b = db.execute("SELECT team_a, team_b FROM matches WHERE id=?", (match_id,)).fetchone()
+    msg = await channel.send(content=" ".join(f"<@{u}>" for u in str_to_ids(a) + str_to_ids(b)),
+                             embed=match_embed(gid, match_id), view=MatchPanel())
+    db.execute("UPDATE matches SET message_id=? WHERE id=?", (msg.id, match_id))
     db.commit()
 
-    embed = discord.Embed(title=f"🏆 10mix 第 {match_id} 場：{winner.name}獲勝！", color=discord.Color.gold())
-    embed.add_field(name=f"勝方 +{points}", value="\n".join(f"<@{u}>" for u in winners))
-    embed.add_field(name=f"敗方 -{points}", value="\n".join(f"<@{u}>" for u in losers))
+
+def finish_mix(gid, match_id, side):
+    """Record a 10mix result (side "A" / "B", or None to cancel). Returns the card's new embed,
+    or None if the game was already recorded or cancelled."""
+    row = db.execute("SELECT team_a, team_b, status FROM matches WHERE id=? AND guild_id=?", (match_id, gid)).fetchone()
+    if row is None or row[2] != "open":
+        return None
+    if side is None:
+        db.execute("UPDATE matches SET status='cancelled' WHERE id=?", (match_id,))
+        db.commit()
+        return discord.Embed(title=f"❌ 10mix 第 {match_id} 場已取消", description="ELO 不變。",
+                             color=discord.Color.dark_grey())
+    a, b = str_to_ids(row[0]), str_to_ids(row[1])
+    winners, losers = (a, b) if side == "A" else (b, a)
+    points = mix_change(sum(get_player(gid, u)[0] for u in winners) / len(winners),
+                        sum(get_player(gid, u)[0] for u in losers) / len(losers))
+    record(gid, winners, won=True, change=points)
+    record(gid, losers, won=False, change=points)
+    db.execute("UPDATE matches SET status='done', winner=? WHERE id=?", (side, match_id))
+    db.commit()
+    embed = discord.Embed(title=f"🏆 10mix 第 {match_id} 場：{side} 隊獲勝！", color=discord.Color.gold())
+    embed.add_field(name=f"勝方 +{points}", value="\n".join(f"<@{u}> → {get_player(gid, u)[0]}" for u in winners))
+    embed.add_field(name=f"敗方 -{points}", value="\n".join(f"<@{u}> → {get_player(gid, u)[0]}" for u in losers))
     embed.set_footer(text=f"金幣：勝方 +{CREDIT_WIN}｜敗方 +{CREDIT_LOSS}")
-    await interaction.response.send_message(embed=embed)
+    return embed
 
 
-client.tree.add_command(result_group)
+class MatchPanel(discord.ui.View):
+    """One small 🔒 button under a match card. Only the bot owner can use it: it opens a private panel
+    to record the result. Fixed custom id (the match is found from the message), so it survives restarts."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+        button = discord.ui.Button(label="🔒 管理", custom_id="mixres:manage", style=discord.ButtonStyle.secondary)
+        button.callback = self.manage
+        self.add_item(button)
+
+    async def manage(self, interaction: discord.Interaction):
+        if interaction.user.id != client.owner_id:
+            await interaction.response.send_message("只有 bot 擁有者可以記錄結果。", ephemeral=True)
+            return
+        row = db.execute("SELECT id, status FROM matches WHERE guild_id=? AND message_id=?",
+                         (interaction.guild_id, interaction.message.id)).fetchone()
+        if row is None or row[1] != "open":
+            await interaction.response.edit_message(view=None)  # stale card: just drop the button
+            return
+        await interaction.response.send_message(f"📝 第 {row[0]} 場：邊隊贏？", view=ResultChoice(row[0], interaction.message),
+                                                ephemeral=True)
+
+
+class ResultChoice(discord.ui.View):
+    """The owner's private panel: A 隊贏 / B 隊贏 / 取消. Updates the public match card."""
+
+    def __init__(self, match_id, card):
+        super().__init__(timeout=840)
+        self.match_id, self.card = match_id, card
+        for label, style, side in (("🔵 A 隊贏", discord.ButtonStyle.primary, "A"),
+                                   ("🔴 B 隊贏", discord.ButtonStyle.danger, "B"),
+                                   ("❌ 取消", discord.ButtonStyle.secondary, None)):
+            button = discord.ui.Button(label=label, style=style)
+            button.callback = self.choose(side)
+            self.add_item(button)
+
+    def choose(self, side):
+        async def callback(interaction: discord.Interaction):
+            embed = finish_mix(interaction.guild_id, self.match_id, side)
+            if embed is None:
+                await interaction.response.edit_message(content="呢場已經記錄或者取消咗。", view=None)
+                return
+            done = "已取消" if side is None else f"{side} 隊贏，已記錄"
+            await interaction.response.edit_message(content=f"✅ 第 {self.match_id} 場：{done}。", view=None)
+            try:
+                await self.card.edit(embed=embed, view=None)
+            except discord.HTTPException as e:  # e.g. the card was deleted: post the result instead
+                print(f"Couldn't update match card {self.match_id}: {e!r}")
+                await interaction.channel.send(embed=embed)
+        return callback
+
+
+class QueuePanel(discord.ui.View):
+    """The queue message's buttons. Fixed custom ids, so they keep working after a restart."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+        join = discord.ui.Button(label="加入", custom_id="mixq:join", style=discord.ButtonStyle.success)
+        join.callback = self.join
+        leave = discord.ui.Button(label="離開", custom_id="mixq:leave", style=discord.ButtonStyle.danger)
+        leave.callback = self.leave
+        self.add_item(join)
+        self.add_item(leave)
+
+    async def join(self, interaction: discord.Interaction):
+        gid, uid = interaction.guild_id, interaction.user.id
+        async with queue_lock:
+            match_id = open_match_of(gid, uid)
+            if match_id:
+                await interaction.response.send_message(f"你仲喺第 {match_id} 場（未記錄結果），唔可以排隊。", ephemeral=True)
+                return
+            if uid in queue_ids(gid):
+                await interaction.response.send_message("你已經喺排隊入面。", ephemeral=True)
+                return
+            get_player(gid, uid)
+            db.execute("INSERT INTO mix_queue VALUES (?, ?, ?)", (gid, uid, time.time()))
+            db.commit()
+            picked = take_ten(gid)
+        await interaction.response.edit_message(embed=queue_embed(gid), view=self)
+        if picked:
+            await start_mix_match(interaction.channel, gid, picked)
+
+    async def leave(self, interaction: discord.Interaction):
+        gid = interaction.guild_id
+        async with queue_lock:
+            gone = db.execute("DELETE FROM mix_queue WHERE guild_id=? AND user_id=?", (gid, interaction.user.id)).rowcount
+            db.commit()
+        if not gone:
+            await interaction.response.send_message("你唔喺排隊入面。", ephemeral=True)
+            return
+        await interaction.response.edit_message(embed=queue_embed(gid), view=self)
+
+
+@client.tree.command(name="queuepanel", description="喺呢個頻道放 10mix 排隊面板（只限 bot 擁有者）")
+@app_commands.guild_only()
+async def queuepanel(interaction: discord.Interaction):
+    if interaction.user.id != client.owner_id:
+        await interaction.response.send_message("只有 bot 擁有者可以使用這個指令。", ephemeral=True)
+        return
+    await interaction.response.send_message(embed=queue_embed(interaction.guild_id), view=QueuePanel())
 
 
 # ---------- Riot: ranked Flex games recorded automatically ----------
